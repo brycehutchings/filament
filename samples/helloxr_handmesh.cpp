@@ -33,6 +33,10 @@
 #include <utils/Entity.h>
 #include <utils/EntityManager.h>
 
+#if !defined(__ANDROID__)
+#include "generated/resources/resources.h"
+#endif
+
 #include <vector>
 
 using namespace filament;
@@ -84,11 +88,9 @@ public:
             if (createHand(hand)) {
                 built++;
             }
-        }
-        XRLOG("hand meshes: built %u of %u hand meshes", built, kHandCount);
+        }        XRLOG("hand meshes: built %u of %u hand meshes", built, kHandCount);
         return built > 0;
     }
-
     void update(XrTime displayTime) override {
         auto& rcm = mContext.engine->getRenderableManager();
         for (uint32_t hand = 0; hand < kHandCount; ++hand) {
@@ -166,6 +168,10 @@ public:
                 state.tracker = XR_NULL_HANDLE;
             }
         }
+        if (mMaterial != nullptr) {
+            mContext.engine->destroy(mMaterial);
+            mMaterial = nullptr;
+        }
     }
 
 private:
@@ -187,8 +193,30 @@ private:
                *out != nullptr;
     }
 
+    bool loadMaterial() {
+#if defined(__ANDROID__)
+        std::vector<uint8_t> package;
+        if (!readAsset("xrhand.filamat", &package)) {
+            XRLOG("hand meshes: xrhand.filamat is missing from the assets");
+            return false;
+        }
+        mMaterial = Material::Builder()
+                            .package(package.data(), package.size())
+                            .build(*mContext.engine);
+#else
+        mMaterial = Material::Builder()
+                            .package(RESOURCES_XRHAND_DATA, RESOURCES_XRHAND_SIZE)
+                            .build(*mContext.engine);
+#endif
+        return mMaterial != nullptr;
+    }
+
     bool createHand(uint32_t hand) {
         Hand& state = mHands[hand];
+
+        if (mMaterial == nullptr && !loadMaterial()) {
+            return false;
+        }
 
         XrHandTrackerCreateInfoEXT createInfo = { XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT };
         createInfo.hand = hand == 0 ? XR_HAND_LEFT_EXT : XR_HAND_RIGHT_EXT;
@@ -298,12 +326,15 @@ private:
         state.indexBuffer->setBuffer(engine, { copy(indices.data(), indicesSize), indicesSize,
                 free });
 
-        state.materialInstance = mContext.material->createInstance();
-        state.materialInstance->setParameter("baseColor", RgbType::LINEAR,
-                float3{ 0.55f, 0.42f, 0.36f });
-        state.materialInstance->setParameter("metallic", 0.0f);
-        state.materialInstance->setParameter("roughness", 0.75f);
-        state.materialInstance->setParameter("reflectance", 0.3f);
+        state.materialInstance = mMaterial->createInstance();
+        state.materialInstance->setParameter("fillColor", RgbType::LINEAR,
+                float3{ 0.35f, 0.55f, 0.85f });
+        state.materialInstance->setParameter("edgeColor", RgbType::LINEAR,
+                float3{ 0.75f, 0.90f, 1.0f });
+        state.materialInstance->setParameter("fillOpacity", 0.25f);
+        state.materialInstance->setParameter("edgeOpacity", 0.9f);
+        state.materialInstance->setParameter("edgePower", 2.5f);
+        state.materialInstance->setParameter("edgeWidth", 0.35f);
 
         state.renderable = utils::EntityManager::get().create();
         RenderableManager::Builder(1)
@@ -324,6 +355,7 @@ private:
 
     FeatureContext mContext;
     Hand mHands[kHandCount];
+    Material* mMaterial = nullptr;
 
     PFN_xrCreateHandTrackerEXT mCreateHandTracker = nullptr;
     PFN_xrDestroyHandTrackerEXT mDestroyHandTracker = nullptr;

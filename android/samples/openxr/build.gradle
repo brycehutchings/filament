@@ -82,35 +82,39 @@ tasks.register('collectFilamentAssets', Copy) {
     }
 }
 
-// The material has to be recompiled rather than copied: the desktop build targets `-p desktop`,
-// which contains no mobile shaders, and it must carry the multiview variants.
-tasks.register('compileMaterial', Exec) {
+// The materials have to be recompiled rather than copied: the desktop build targets `-p desktop`,
+// which contains no mobile shaders, and they must carry the multiview variants.
+tasks.register('compileMaterials') {
     def matc = file("${rootDir}/../../../out/cmake-xr/tools/matc/matc" +
             (System.getProperty('os.name').toLowerCase().contains('windows') ? '.exe' : ''))
-    def source = file("${rootDir}/../../../samples/materials/aiDefaultMat.mat")
-    def output = layout.buildDirectory.file('generated/filamentAssets/aiDefaultMat.filamat')
+    def materials = ['aiDefaultMat', 'xrhand']
+    def sourceDir = file("${rootDir}/../../../samples/materials")
+    def outputDir = layout.buildDirectory.dir('generated/filamentAssets')
 
-    inputs.file source
-    outputs.file output
+    inputs.files materials.collect { new File(sourceDir, "${it}.mat") }
+    outputs.files materials.collect { outputDir.get().file("${it}.filamat").asFile }
 
-    doFirst {
+    doLast {
         if (!matc.exists()) {
             throw new GradleException("matc not found at ${matc}. Build the desktop tools first.")
         }
-        output.get().asFile.parentFile.mkdirs()
+        outputDir.get().asFile.mkdirs()
+        materials.each { name ->
+            exec {
+                commandLine matc.absolutePath,
+                        '-a', 'vulkan',
+                        '-p', 'mobile',
+                        '-PstereoscopicType=multiview',
+                        '-o', outputDir.get().file("${name}.filamat").asFile.absolutePath,
+                        new File(sourceDir, "${name}.mat").absolutePath
+            }
+        }
     }
-
-    commandLine matc.absolutePath,
-            '-a', 'vulkan',
-            '-p', 'mobile',
-            '-PstereoscopicType=multiview',
-            '-o', output.get().asFile.absolutePath,
-            source.absolutePath
 }
 
 tasks.configureEach { task ->
     if ((task.name.startsWith('generate') || task.name.startsWith('merge')) &&
             task.name.endsWith('Assets')) {
-        task.dependsOn 'collectFilamentAssets', 'compileMaterial'
+        task.dependsOn 'collectFilamentAssets', 'compileMaterials'
     }
 }

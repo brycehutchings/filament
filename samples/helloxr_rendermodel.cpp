@@ -355,13 +355,6 @@ private:
 
 } // anonymous namespace
 
-Feature::~Feature() = default;
-
-mat4 poseToMat4(XrPosef const& pose) {
-    quat const q{ pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z };
-    return mat4{ mat3{ q }, double3{ pose.position.x, pose.position.y, pose.position.z } };
-}
-
 std::unique_ptr<Feature> createRenderModels() {
     return std::make_unique<RenderModels>();
 }

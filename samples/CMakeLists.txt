@@ -42,6 +42,7 @@ set(MATERIAL_SRCS
         materials/sandboxUnlit.mat
         materials/texturedLit.mat
         materials/uvmorph.mat
+        materials/xrhand.mat
 )
 
 # Tint does not support setting gl_PointSize, disable the relevant sample if using WebGPU
@@ -343,7 +344,8 @@ endif()
 
 if (FILAMENT_ENABLE_OPENXR)
     include_directories(${GENERATION_ROOT})
-    add_executable(helloxr helloxr.cpp helloxr_rendermodel.cpp helloxr_handmesh.cpp)
+    add_executable(helloxr helloxr.cpp helloxr_features.cpp helloxr_rendermodel.cpp
+            helloxr_handmesh.cpp)
     target_compile_options(helloxr PRIVATE ${COMPILER_FLAGS})
     target_link_libraries(helloxr PRIVATE
         filament

@@ -48,6 +48,7 @@
 
 #include <cstdio>
 #include <memory>
+#include <string>
 #include <vector>
 
 #if defined(__ANDROID__)
@@ -99,6 +100,15 @@ std::unique_ptr<Feature> createRenderModels();
 std::unique_ptr<Feature> createHandMeshes();
 
 filament::math::mat4 poseToMat4(XrPosef const& pose);
+
+// Android routes asset reads through the APK, so the host app hands over the manager up front.
+void setAssetManager(void* assetManager);
+
+// Reads an APK asset on Android, a plain file elsewhere.
+bool readAsset(std::string const& name, std::vector<uint8_t>* out);
+
+// Always reads the filesystem, on every platform.
+bool readFile(std::string const& path, std::vector<uint8_t>* out);
 
 } // namespace helloxr
 

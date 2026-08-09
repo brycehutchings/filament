@@ -96,36 +96,6 @@ namespace {
 constexpr uint32_t kEyeCount = 2;
 constexpr XrViewConfigurationType kViewConfigType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
 
-#if defined(__ANDROID__)
-AAssetManager* gAssetManager = nullptr;
-#endif
-
-bool readFile(std::string const& path, std::vector<uint8_t>* out) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) {
-        return false;
-    }
-    *out = std::vector<uint8_t>((std::istreambuf_iterator<char>(file)),
-            std::istreambuf_iterator<char>());
-    return !out->empty();
-}
-
-// The sample's only I/O seam: APK assets on Android, plain files elsewhere.
-bool readAsset(std::string const& name, std::vector<uint8_t>* out) {
-#if defined(__ANDROID__)
-    AAsset* asset = AAssetManager_open(gAssetManager, name.c_str(), AASSET_MODE_BUFFER);
-    if (!asset) {
-        return false;
-    }
-    out->resize(size_t(AAsset_getLength(asset)));
-    int const read = AAsset_read(asset, out->data(), out->size());
-    AAsset_close(asset);
-    return read == int(out->size());
-#else
-    return readFile(name, out);
-#endif
-}
-
 // Filament treats a swapchain with no native window as headless and then never calls present();
 // the pointer itself is never dereferenced because XrVulkanPlatform owns the real swapchain.
 void* const kNativeWindowSentinel = reinterpret_cast<void*>(uintptr_t(1));
@@ -1321,8 +1291,8 @@ private:
         mView = mEngine->createView();
 
 #if defined(__ANDROID__)
-        if (!readAsset("aiDefaultMat.filamat", &mMaterialPackage) ||
-                !readAsset("suzanne.filamesh", &mMeshData)) {
+        if (!helloxr::readAsset("aiDefaultMat.filamat", &mMaterialPackage) ||
+                !helloxr::readAsset("suzanne.filamesh", &mMeshData)) {
             XRLOG("failed to read the material or mesh from the APK assets");
             return false;
         }
@@ -1384,8 +1354,8 @@ private:
         }
         std::vector<uint8_t> iblData;
         std::vector<uint8_t> skyData;
-        if (!readAsset(mConfig.ibl + "_ibl.ktx", &iblData) ||
-                !readAsset(mConfig.ibl + "_skybox.ktx", &skyData)) {
+        if (!helloxr::readAsset(mConfig.ibl + "_ibl.ktx", &iblData) ||
+                !helloxr::readAsset(mConfig.ibl + "_skybox.ktx", &skyData)) {
             XRLOG("no IBL at '%s'; using a flat skybox", mConfig.ibl.c_str());
             return false;
         }
@@ -1753,7 +1723,7 @@ bool parseArguments(std::vector<std::string> const& args, Config* config) {
 // run be configured over adb without any JNI plumbing:
 //   adb shell "echo --frames=300 --ibl= > /sdcard/Android/data/<pkg>/files/args.txt"
 void android_main(android_app* app) {
-    gAssetManager = app->activity->assetManager;
+    helloxr::setAssetManager(app->activity->assetManager);
 
     Config config;
     std::string const dataDir = app->activity->externalDataPath != nullptr
@@ -1763,7 +1733,7 @@ void android_main(android_app* app) {
 
     std::vector<uint8_t> argsFile;
     std::vector<std::string> args;
-    if (readFile(dataDir + "/args.txt", &argsFile)) {
+    if (helloxr::readFile(dataDir + "/args.txt", &argsFile)) {
         std::string const contents(argsFile.begin(), argsFile.end());
         std::istringstream stream(contents);
         for (std::string token; stream >> token;) {
