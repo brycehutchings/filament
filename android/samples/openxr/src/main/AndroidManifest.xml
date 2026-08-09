@@ -9,6 +9,10 @@
     <uses-feature android:name="oculus.software.handtracking" android:required="false" />
     <uses-permission android:name="com.oculus.permission.HAND_TRACKING" />
 
+    <!-- Meta only advertises XR_FB_render_model to apps that ask for it. -->
+    <uses-permission android:name="com.oculus.permission.RENDER_MODEL" />
+    <uses-feature android:name="com.oculus.feature.RENDER_MODEL" android:required="false" />
+
     <application
         android:label="Filament OpenXR"
         android:allowBackup="false"

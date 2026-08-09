@@ -162,6 +162,7 @@ struct Config {
     double farPlane = 100.0;
     bool validation = true;
     bool depthLayer = true;
+    bool listExtensions = false;
     uint32_t dumpFrame = 0;         // 0 means "never dump"
     std::string dumpPrefix = "helloxr";
 };
@@ -771,6 +772,13 @@ private:
                         return strcmp(e.extensionName, name) == 0;
                     });
         };
+
+        if (mConfig.listExtensions) {
+            XRLOG("runtime exposes %u extensions:", extensionCount);
+            for (auto const& e: available) {
+                XRLOG("  %s (v%u)", e.extensionName, e.extensionVersion);
+            }
+        }
 
         if (!supports(XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME)) {
             XRLOG("runtime does not support %s", XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME);
@@ -1652,6 +1660,7 @@ void printUsage() {
           "  --ibl=PREFIX      load PREFIX_ibl.ktx and PREFIX_skybox.ktx, empty to disable\n"
           "  --no-validation   do not request the Vulkan validation layer\n"
           "  --no-depth-layer  do not submit depth with the projection layer\n"
+          "  --list-extensions log every extension the runtime exposes\n"
           "  --help            print this message");
 }
 
@@ -1679,6 +1688,8 @@ bool parseArguments(std::vector<std::string> const& args, Config* config) {
             config->validation = false;
         } else if (arg == "--no-depth-layer") {
             config->depthLayer = false;
+        } else if (arg == "--list-extensions") {
+            config->listExtensions = true;
         } else {
             XRLOG("unknown argument: %s", arg.c_str());
             printUsage();
