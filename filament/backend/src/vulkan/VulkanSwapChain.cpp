@@ -59,7 +59,7 @@ VulkanSwapChain::~VulkanSwapChain() {
     mCommands->wait();
 
     mColors = {};
-    mDepth = {};
+    mDepths = {};
     for (auto& semaphore : mFinishedDrawing) {
         semaphore = {};
     }
@@ -69,6 +69,7 @@ VulkanSwapChain::~VulkanSwapChain() {
 
 void VulkanSwapChain::update() {
     mColors.clear();
+    mDepths.clear();
 
     auto const bundle = mPlatform->getSwapChainBundle(swapChain);
     size_t const swapChainCount = bundle.colors.size();
@@ -99,14 +100,13 @@ void VulkanSwapChain::update() {
         mColors.push_back(colorTexture);
     }
 
-    if (bundle.depth != VK_NULL_HANDLE) {
-        mDepth = fvkmemory::resource_ptr<VulkanTexture>::construct(mResourceManager, mContext,
-                device, mAllocator, mResourceManager, mCommands, bundle.depth, VK_NULL_HANDLE,
+    mDepths.reserve(bundle.depths.size());
+    for (auto const depth: bundle.depths) {
+        mDepths.push_back(fvkmemory::resource_ptr<VulkanTexture>::construct(mResourceManager,
+                mContext, device, mAllocator, mResourceManager, mCommands, depth, VK_NULL_HANDLE,
                 bundle.depthFormat, VK_NULL_HANDLE /*ycrcb */, VK_NULL_HANDLE, VK_NULL_HANDLE,
                 Platform::ExternalImageHandle(), /*levels=*/1, /*samples=*/1, bundle.extent.width,
-                bundle.extent.height, bundle.layerCount, depthUsage, mStagePool);
-    } else {
-        mDepth = {};
+                bundle.extent.height, bundle.layerCount, depthUsage, mStagePool));
     }
 
     mExtent = bundle.extent;

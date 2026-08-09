@@ -110,14 +110,14 @@ VulkanPlatformSwapChainBase::VulkanPlatformSwapChainBase(VulkanContext const& co
 VulkanPlatformSwapChainBase::~VulkanPlatformSwapChainBase() = default;
 
 void VulkanPlatformSwapChainBase::destroy() {
-    if (mSwapChainBundle.depth) {
-        vkDestroyImage(mDevice, mSwapChainBundle.depth, VKALLOC);
-        if (mMemory.find(mSwapChainBundle.depth) != mMemory.end()) {
-            vkFreeMemory(mDevice, mMemory.at(mSwapChainBundle.depth), VKALLOC);
-            mMemory.erase(mSwapChainBundle.depth);
+    for (auto depth: mSwapChainBundle.depths) {
+        vkDestroyImage(mDevice, depth, VKALLOC);
+        if (mMemory.find(depth) != mMemory.end()) {
+            vkFreeMemory(mDevice, mMemory.at(depth), VKALLOC);
+            mMemory.erase(depth);
         }
     }
-    mSwapChainBundle.depth = VK_NULL_HANDLE;
+    mSwapChainBundle.depths.clear();
 
     // Note: Hardware-backed swapchain images are not owned by us and should not be destroyed.
     mSwapChainBundle.colors.clear();
@@ -285,8 +285,9 @@ VkResult VulkanPlatformSurfaceSwapChain::create() {
     mSwapChainBundle.colorFormat = surfaceFormat.format;
     mSwapChainBundle.depthFormat =
             selectDepthFormat(mContext.getAttachmentDepthStencilFormats(), mHasStencil);
-    mSwapChainBundle.depth = createImage(mSwapChainBundle.extent,
-            mSwapChainBundle.depthFormat, mIsProtected);
+    mSwapChainBundle.depths = FixedCapacityVector<VkImage>::with_capacity(1);
+    mSwapChainBundle.depths.push_back(createImage(mSwapChainBundle.extent,
+            mSwapChainBundle.depthFormat, mIsProtected));
     mSwapChainBundle.isProtected = mIsProtected;
 
     FVK_LOGI << "vkCreateSwapchain"
@@ -484,7 +485,9 @@ VulkanPlatformHeadlessSwapChain::VulkanPlatformHeadlessSwapChain(VulkanContext c
     bool const hasStencil = (flags & backend::SWAP_CHAIN_HAS_STENCIL_BUFFER) != 0;
     mSwapChainBundle.depthFormat =
             selectDepthFormat(mContext.getAttachmentDepthStencilFormats(), hasStencil);
-    mSwapChainBundle.depth = createImage(extent, mSwapChainBundle.depthFormat, false);
+    mSwapChainBundle.depths = FixedCapacityVector<VkImage>::with_capacity(1);
+    mSwapChainBundle.depths.push_back(
+            createImage(extent, mSwapChainBundle.depthFormat, false));
 }
 
 VulkanPlatformHeadlessSwapChain::~VulkanPlatformHeadlessSwapChain() {

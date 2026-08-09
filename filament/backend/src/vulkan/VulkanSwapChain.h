@@ -62,7 +62,11 @@ struct VulkanSwapChain : public HwSwapChain, fvkmemory::Resource {
     }
 
     inline fvkmemory::resource_ptr<VulkanTexture> getDepth() const noexcept {
-        return mDepth;
+        if (mDepths.empty()) {
+            return {};
+        }
+        // A platform may share a single depth image across all color images.
+        return mDepths[mDepths.size() == 1 ? 0 : mCurrentSwapIndex];
     }
 
     inline bool isFirstRenderPass() const noexcept {
@@ -117,7 +121,7 @@ private:
     // transitions, which are useful here.
     utils::FixedCapacityVector<fvkmemory::resource_ptr<VulkanTexture>> mColors;
     utils::FixedCapacityVector<fvkmemory::resource_ptr<VulkanSemaphore>> mFinishedDrawing;
-    fvkmemory::resource_ptr<VulkanTexture> mDepth;
+    utils::FixedCapacityVector<fvkmemory::resource_ptr<VulkanTexture>> mDepths;
     VkExtent2D mExtent;
     uint32_t mLayerCount;
     uint32_t mCurrentSwapIndex;
