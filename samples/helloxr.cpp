@@ -35,6 +35,11 @@
 // both of which openxr_platform.h expects to already be present.
 #include <bluevk/BlueVK.h>
 
+#if defined(__ANDROID__)
+// openxr_platform.h uses JNI types under XR_USE_PLATFORM_ANDROID but does not include jni.h itself.
+#include <jni.h>
+#endif
+
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
@@ -68,8 +73,14 @@
 #include <math/quat.h>
 #include <math/vec3.h>
 
+#if defined(__ANDROID__)
+#include <android/asset_manager.h>
+#include <android/log.h>
+#include <android_native_app_glue.h>
+#else
 #include "generated/resources/monkey.h"
 #include "generated/resources/resources.h"
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -79,8 +90,10 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace filament;
@@ -93,27 +106,67 @@ namespace {
 constexpr uint32_t kEyeCount = 2;
 constexpr XrViewConfigurationType kViewConfigType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
 
+#if defined(__ANDROID__)
+AAssetManager* gAssetManager = nullptr;
+#endif
+
+bool readFile(std::string const& path, std::vector<uint8_t>* out) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return false;
+    }
+    *out = std::vector<uint8_t>((std::istreambuf_iterator<char>(file)),
+            std::istreambuf_iterator<char>());
+    return !out->empty();
+}
+
+// The sample's only I/O seam: APK assets on Android, plain files elsewhere.
+bool readAsset(std::string const& name, std::vector<uint8_t>* out) {
+#if defined(__ANDROID__)
+    AAsset* asset = AAssetManager_open(gAssetManager, name.c_str(), AASSET_MODE_BUFFER);
+    if (!asset) {
+        return false;
+    }
+    out->resize(size_t(AAsset_getLength(asset)));
+    int const read = AAsset_read(asset, out->data(), out->size());
+    AAsset_close(asset);
+    return read == int(out->size());
+#else
+    return readFile(name, out);
+#endif
+}
+
 // Filament treats a swapchain with no native window as headless and then never calls present();
 // the pointer itself is never dereferenced because XrVulkanPlatform owns the real swapchain.
 void* const kNativeWindowSentinel = reinterpret_cast<void*>(uintptr_t(1));
 
+#if defined(__ANDROID__)
+#define XRLOG(...) __android_log_print(ANDROID_LOG_INFO, "helloxr", __VA_ARGS__)
+#else
 #define XRLOG(...) do { printf("[helloxr] " __VA_ARGS__); printf("\n"); fflush(stdout); } while (0)
+#endif
 
 struct Config {
     uint32_t frames = 0;            // 0 means "no frame limit"
+#if defined(__ANDROID__)
+    // On Android the app is an Activity the user (or `adb shell am force-stop`) can close, so the
+    // watchdog that keeps desktop runs bounded would only get in the way.
+    double timeoutSeconds = 0.0;
+    std::string ibl = "lightroom_14b";
+#else
     double timeoutSeconds = 15.0;   // 0 means "no timeout"
+    // Prefix of a pair of <prefix>_ibl.ktx / <prefix>_skybox.ktx files, as produced by cmgen.
+    std::string ibl = "assets/ibl/lightroom_14b/lightroom_14b";
+#endif
     double nearPlane = 0.05;
     double farPlane = 100.0;
     bool validation = true;
     bool depthLayer = true;
-    // Prefix of a pair of <prefix>_ibl.ktx / <prefix>_skybox.ktx files, as produced by cmgen.
-    std::string ibl = "assets/ibl/lightroom_14b/lightroom_14b";
     uint32_t dumpFrame = 0;         // 0 means "never dump"
     std::string dumpPrefix = "helloxr";
 };
 
-char const* xrResultName(XrInstance instance, XrResult result) {
-    static char buffer[XR_MAX_RESULT_STRING_SIZE];
+char const* xrResultName(XrInstance instance, XrResult result) {    static char buffer[XR_MAX_RESULT_STRING_SIZE];
     if (instance != XR_NULL_HANDLE && XR_SUCCEEDED(xrResultToString(instance, result, buffer))) {
         return buffer;
     }
@@ -387,17 +440,35 @@ private:
         std::vector<uint8_t> geometryMask(pixelsPerLayer * layers, 0);
         for (uint32_t layer = 0; layer < layers; ++layer) {
             uint8_t const* data = color.data() + layer * pixelsPerLayer * 4;
-            // The corner is always sky, so it doubles as the background reference.
-            uint8_t const* background = data;
+            // The most common color is the sky; a fixed reference pixel is no good because the
+            // subject can end up anywhere once the headset moves.
+            std::unordered_map<uint32_t, uint32_t> histogram;
+            for (size_t i = 0; i < pixelsPerLayer; i += 32) {
+                uint8_t const* pixel = data + i * 4;
+                uint32_t const key = (uint32_t(pixel[0]) << 16) | (uint32_t(pixel[1]) << 8) |
+                                     uint32_t(pixel[2]);
+                histogram[key]++;
+            }
+            uint32_t background = 0;
+            uint32_t backgroundCount = 0;
+            for (auto const& entry: histogram) {
+                if (entry.second > backgroundCount) {
+                    backgroundCount = entry.second;
+                    background = entry.first;
+                }
+            }
+            int const bgR = int((background >> 16) & 0xFF);
+            int const bgG = int((background >> 8) & 0xFF);
+            int const bgB = int(background & 0xFF);
+
             double luma = 0.0;
             size_t geometry = 0;
             double centroidX = 0.0;
             for (size_t i = 0; i < pixelsPerLayer; ++i) {
                 uint8_t const* pixel = data + i * 4;
                 luma += (pixel[0] + pixel[1] + pixel[2]) / 3.0;
-                int const delta = std::abs(int(pixel[0]) - background[0]) +
-                                  std::abs(int(pixel[1]) - background[1]) +
-                                  std::abs(int(pixel[2]) - background[2]);
+                int const delta = std::abs(int(pixel[0]) - bgR) + std::abs(int(pixel[1]) - bgG) +
+                                  std::abs(int(pixel[2]) - bgB);
                 if (delta > 12) {
                     geometryMask[layer * pixelsPerLayer + i] = 1;
                     geometry++;
@@ -423,12 +494,14 @@ private:
             return;
         }
         if (bundle.depthFormat != VK_FORMAT_D32_SFLOAT &&
-                bundle.depthFormat != VK_FORMAT_D32_SFLOAT_S8_UINT) {
+                bundle.depthFormat != VK_FORMAT_D32_SFLOAT_S8_UINT &&
+                bundle.depthFormat != VK_FORMAT_D24_UNORM_S8_UINT) {
             XRLOG("frame dump: unsupported depth format %d", int(bundle.depthFormat));
             return;
         }
         VkImageAspectFlags depthAspect = VK_IMAGE_ASPECT_DEPTH_BIT;
-        if (bundle.depthFormat == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+        if (bundle.depthFormat == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+                bundle.depthFormat == VK_FORMAT_D24_UNORM_S8_UINT) {
             depthAspect |= VK_IMAGE_ASPECT_STENCIL_BIT;
         }
         std::vector<uint8_t> const depthBytes = readBack(bundle.depths[index], depthAspect,
@@ -438,7 +511,32 @@ private:
             XRLOG("frame dump: depth read back failed");
             return;
         }
-        auto const* depth = reinterpret_cast<float const*>(depthBytes.data());
+
+        // The depth aspect of D24_UNORM_S8_UINT copies out as X8_D24_UNORM_PACK32, which holds the
+        // depth in bits 8..31.
+        bool const isPacked24 = bundle.depthFormat == VK_FORMAT_D24_UNORM_S8_UINT;
+        uint32_t maxRaw = 0;
+        std::vector<float> depthValues(pixelsPerLayer * layers);
+        for (size_t i = 0; i < depthValues.size(); ++i) {
+            uint32_t raw;
+            memcpy(&raw, depthBytes.data() + i * 4, sizeof(raw));
+            maxRaw = std::max(maxRaw, raw);
+            if (isPacked24) {
+                depthValues[i] = float(raw >> 8) / 16777215.0f;
+            } else {
+                memcpy(&depthValues[i], &raw, sizeof(float));
+            }
+        }
+        XRLOG("frame dump: depth format %d, max raw word 0x%08x", int(bundle.depthFormat), maxRaw);
+        if (maxRaw == 0) {
+            // Distinguishes "the runtime would not let us read the image" from "nothing was drawn".
+            // Some runtimes (Meta's on Quest) appear not to honour XR_SWAPCHAIN_USAGE_TRANSFER_SRC
+            // on depth swapchains, which makes the copy yield nothing.
+            XRLOG("frame dump: depth read back empty; the runtime likely disallows copying from "
+                  "the depth swapchain, so this says nothing about what was rendered");
+            return;
+        }
+        float const* depth = depthValues.data();
         for (uint32_t layer = 0; layer < layers; ++layer) {
             float const* data = depth + layer * pixelsPerLayer;
             uint8_t const* mask = geometryMask.data() + layer * pixelsPerLayer;
@@ -504,7 +602,11 @@ private:
 
 class HelloXr {
 public:
+#if defined(__ANDROID__)
+    HelloXr(Config const& config, android_app* app) : mConfig(config), mApp(app) {}
+#else
     explicit HelloXr(Config const& config) : mConfig(config) {}
+#endif
 
     ~HelloXr() {
         if (mEngine) {
@@ -561,6 +663,7 @@ public:
         uint32_t framesSinceReport = 0;
 
         while (!mExitRequested) {
+            pumpAndroidEvents();
             pollEvents();
             if (mExitRequested) {
                 break;
@@ -630,6 +733,26 @@ private:
     }
 
     bool createXrInstance() {
+#if defined(__ANDROID__)
+        // Must happen before any other OpenXR call: the Android loader needs the VM and Activity
+        // to find the runtime through the system broker.
+        PFN_xrInitializeLoaderKHR initializeLoader = nullptr;
+        if (XR_FAILED(xrGetInstanceProcAddr(XR_NULL_HANDLE, "xrInitializeLoaderKHR",
+                    reinterpret_cast<PFN_xrVoidFunction*>(&initializeLoader))) ||
+                initializeLoader == nullptr) {
+            XRLOG("xrInitializeLoaderKHR is unavailable");
+            return false;
+        }
+        XrLoaderInitInfoAndroidKHR loaderInfo = { XR_TYPE_LOADER_INIT_INFO_ANDROID_KHR };
+        loaderInfo.applicationVM = mApp->activity->vm;
+        loaderInfo.applicationContext = mApp->activity->clazz;
+        if (!xrCheck(initializeLoader(
+                    reinterpret_cast<XrLoaderInitInfoBaseHeaderKHR const*>(&loaderInfo)),
+                "xrInitializeLoaderKHR")) {
+            return false;
+        }
+#endif
+
         uint32_t extensionCount = 0;
         if (!xrCheck(xrEnumerateInstanceExtensionProperties(nullptr, 0, &extensionCount, nullptr),
                     "xrEnumerateInstanceExtensionProperties")) {
@@ -666,6 +789,17 @@ private:
         }
 
         XrInstanceCreateInfo createInfo = { XR_TYPE_INSTANCE_CREATE_INFO };
+#if defined(__ANDROID__)
+        if (!supports(XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME)) {
+            XRLOG("runtime does not support %s", XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME);
+            return false;
+        }
+        extensions.push_back(XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME);
+        XrInstanceCreateInfoAndroidKHR androidInfo = { XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR };
+        androidInfo.applicationVM = mApp->activity->vm;
+        androidInfo.applicationActivity = mApp->activity->clazz;
+        createInfo.next = &androidInfo;
+#endif
         snprintf(createInfo.applicationInfo.applicationName,
                 sizeof(createInfo.applicationInfo.applicationName), "helloxr");
         snprintf(createInfo.applicationInfo.engineName,
@@ -1145,17 +1279,32 @@ private:
         mScene = mEngine->createScene();
         mView = mEngine->createView();
 
-        mMaterial = Material::Builder()
-                            .package(RESOURCES_AIDEFAULTMAT_DATA, RESOURCES_AIDEFAULTMAT_SIZE)
-                            .build(*mEngine);
+#if defined(__ANDROID__)
+        if (!readAsset("aiDefaultMat.filamat", &mMaterialPackage) ||
+                !readAsset("suzanne.filamesh", &mMeshData)) {
+            XRLOG("failed to read the material or mesh from the APK assets");
+            return false;
+        }
+        void const* materialData = mMaterialPackage.data();
+        size_t const materialSize = mMaterialPackage.size();
+        void const* meshData = mMeshData.data();
+        size_t const meshSize = mMeshData.size();
+#else
+        void const* materialData = RESOURCES_AIDEFAULTMAT_DATA;
+        size_t const materialSize = RESOURCES_AIDEFAULTMAT_SIZE;
+        void const* meshData = MONKEY_SUZANNE_DATA;
+        size_t const meshSize = MONKEY_SUZANNE_SIZE;
+#endif
+
+        mMaterial = Material::Builder().package(materialData, materialSize).build(*mEngine);
         mMaterialInstance = mMaterial->createInstance();
         mMaterialInstance->setParameter("baseColor", RgbType::LINEAR, float3{ 0.8f, 1.0f, 1.0f });
         mMaterialInstance->setParameter("metallic", 0.0f);
         mMaterialInstance->setParameter("roughness", 0.4f);
         mMaterialInstance->setParameter("reflectance", 0.5f);
 
-        mMonkey = filamesh::MeshReader::loadMeshFromBuffer(mEngine, MONKEY_SUZANNE_DATA,
-                MONKEY_SUZANNE_SIZE, nullptr, nullptr, mMaterialInstance);
+        mMonkey = filamesh::MeshReader::loadMeshFromBuffer(mEngine, meshData, meshSize, nullptr,
+                nullptr, mMaterialInstance);
         auto& rcm = mEngine->getRenderableManager();
         rcm.setCastShadows(rcm.getInstance(mMonkey.renderable), false);
         mScene->addEntity(mMonkey.renderable);
@@ -1187,26 +1336,15 @@ private:
         return true;
     }
 
-    // The only host-filesystem dependency in the sample; an Android port replaces this with an
-    // asset-manager read. Returns false when the files are absent so the caller can fall back.
+    // Falls back to a flat skybox when the files are absent, so the sample runs from anywhere.
     bool loadIbl() {
         if (mConfig.ibl.empty()) {
             return false;
         }
-        auto readFile = [](std::string const& path, std::vector<uint8_t>* out) {
-            std::ifstream file(path, std::ios::binary);
-            if (!file) {
-                return false;
-            }
-            *out = std::vector<uint8_t>((std::istreambuf_iterator<char>(file)),
-                    std::istreambuf_iterator<char>());
-            return !out->empty();
-        };
-
         std::vector<uint8_t> iblData;
         std::vector<uint8_t> skyData;
-        if (!readFile(mConfig.ibl + "_ibl.ktx", &iblData) ||
-                !readFile(mConfig.ibl + "_skybox.ktx", &skyData)) {
+        if (!readAsset(mConfig.ibl + "_ibl.ktx", &iblData) ||
+                !readAsset(mConfig.ibl + "_skybox.ktx", &skyData)) {
             XRLOG("no IBL at '%s'; using a flat skybox", mConfig.ibl.c_str());
             return false;
         }
@@ -1229,6 +1367,26 @@ private:
         mSkybox = Skybox::Builder().environment(mSkyboxTexture).showSun(true).build(*mEngine);
         XRLOG("loaded IBL from '%s'", mConfig.ibl.c_str());
         return true;
+    }
+
+    // Keeps the Activity lifecycle moving; without draining the looper the app would ANR.
+    void pumpAndroidEvents() {
+#if defined(__ANDROID__)
+        int events = 0;
+        android_poll_source* source = nullptr;
+        // Block only while there is nothing to draw, otherwise never stall the render loop.
+        int const timeoutMs = mSessionRunning ? 0 : 100;
+        while (ALooper_pollOnce(timeoutMs, nullptr, &events,
+                       reinterpret_cast<void**>(&source)) >= 0) {
+            if (source != nullptr) {
+                source->process(mApp, source);
+            }
+            if (mApp->destroyRequested != 0) {
+                mExitRequested = true;
+                return;
+            }
+        }
+#endif
     }
 
     void pollEvents() {
@@ -1462,6 +1620,11 @@ private:
     filamesh::MeshReader::Mesh mMonkey;
     utils::Entity mCameraEntity;
     utils::Entity mLight;
+#if defined(__ANDROID__)
+    android_app* mApp = nullptr;
+    std::vector<uint8_t> mMaterialPackage;
+    std::vector<uint8_t> mMeshData;
+#endif
 
     uint32_t mEyeWidth = 0;
     uint32_t mEyeHeight = 0;
@@ -1476,25 +1639,24 @@ private:
 namespace {
 
 void printUsage() {
-    printf("helloxr: renders a Filament scene through OpenXR using Vulkan multiview.\n"
-           "\n"
-           "Options:\n"
-           "  --frames=N        stop after N frames (default: unlimited)\n"
-           "  --timeout=S       stop after S seconds, 0 to disable (default: 15)\n"
-           "  --near=D          near plane distance in meters (default: 0.05)\n"
-           "  --far=D           far plane distance in meters (default: 100)\n"
-           "  --dump-frame=N    read frame N back and report per-eye color and depth stats\n"
-           "                    (the color/depth cross-check assumes --ibl= i.e. a flat skybox)\n"
-           "  --dump-prefix=P   file name prefix for --dump-frame (default: helloxr)\n"
-           "  --ibl=PREFIX      load PREFIX_ibl.ktx and PREFIX_skybox.ktx, empty to disable\n"
-           "  --no-validation   do not request the Vulkan validation layer\n"
-           "  --no-depth-layer  do not submit depth with the projection layer\n"
-           "  --help            print this message\n");
+    XRLOG("helloxr: renders a Filament scene through OpenXR using Vulkan multiview.\n"
+          "\n"
+          "Options:\n"
+          "  --frames=N        stop after N frames (default: unlimited)\n"
+          "  --timeout=S       stop after S seconds, 0 to disable\n"
+          "  --near=D          near plane distance in meters (default: 0.05)\n"
+          "  --far=D           far plane distance in meters (default: 100)\n"
+          "  --dump-frame=N    read frame N back and report per-eye color and depth stats\n"
+          "                    (the color/depth cross-check assumes --ibl= i.e. a flat skybox)\n"
+          "  --dump-prefix=P   file name prefix for --dump-frame\n"
+          "  --ibl=PREFIX      load PREFIX_ibl.ktx and PREFIX_skybox.ktx, empty to disable\n"
+          "  --no-validation   do not request the Vulkan validation layer\n"
+          "  --no-depth-layer  do not submit depth with the projection layer\n"
+          "  --help            print this message");
 }
 
-bool parseArguments(int argc, char** argv, Config* config) {
-    for (int i = 1; i < argc; ++i) {
-        std::string const arg = argv[i];
+bool parseArguments(std::vector<std::string> const& args, Config* config) {
+    for (std::string const& arg: args) {
         auto const startsWith = [&arg](char const* prefix) { return arg.rfind(prefix, 0) == 0; };
         if (arg == "--help" || arg == "-h") {
             printUsage();
@@ -1518,7 +1680,7 @@ bool parseArguments(int argc, char** argv, Config* config) {
         } else if (arg == "--no-depth-layer") {
             config->depthLayer = false;
         } else {
-            printf("unknown argument: %s\n", arg.c_str());
+            XRLOG("unknown argument: %s", arg.c_str());
             printUsage();
             return false;
         }
@@ -1528,9 +1690,50 @@ bool parseArguments(int argc, char** argv, Config* config) {
 
 } // anonymous namespace
 
-int main(int argc, char** argv) {
+#if defined(__ANDROID__)
+
+// There is no argv on Android. An optional args.txt in the app's external files directory lets a
+// run be configured over adb without any JNI plumbing:
+//   adb shell "echo --frames=300 --ibl= > /sdcard/Android/data/<pkg>/files/args.txt"
+void android_main(android_app* app) {
+    gAssetManager = app->activity->assetManager;
+
     Config config;
-    if (!parseArguments(argc, argv, &config)) {
+    std::string const dataDir = app->activity->externalDataPath != nullptr
+                                        ? app->activity->externalDataPath
+                                        : app->activity->internalDataPath;
+    config.dumpPrefix = dataDir + "/helloxr";
+
+    std::vector<uint8_t> argsFile;
+    std::vector<std::string> args;
+    if (readFile(dataDir + "/args.txt", &argsFile)) {
+        std::string const contents(argsFile.begin(), argsFile.end());
+        std::istringstream stream(contents);
+        for (std::string token; stream >> token;) {
+            args.push_back(token);
+        }
+        XRLOG("read %zu argument(s) from args.txt", args.size());
+    }
+    if (!parseArguments(args, &config)) {
+        ANativeActivity_finish(app->activity);
+        return;
+    }
+
+    {
+        HelloXr xr(config, app);
+        if (xr.initialize()) {
+            xr.run();
+        }
+    }
+    ANativeActivity_finish(app->activity);
+}
+
+#else
+
+int main(int argc, char** argv) {
+    std::vector<std::string> const args(argv + 1, argv + argc);
+    Config config;
+    if (!parseArguments(args, &config)) {
         return EXIT_FAILURE;
     }
 
@@ -1541,3 +1744,5 @@ int main(int argc, char** argv) {
     app.run();
     return EXIT_SUCCESS;
 }
+
+#endif
