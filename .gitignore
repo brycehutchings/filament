@@ -24,3 +24,7 @@ results
 /gltf
 /filament-assets
 /venv
+
+# Build output left behind inside vendored third_party projects
+/third_party/dawn/tools/android/build/
+/third_party/libwebp/.gradle/
