@@ -335,6 +335,29 @@ if (NOT ANDROID)
 endif()
 
 # ==================================================================================================
+# OpenXR sample
+#
+# Deliberately does not depend on filamentapp/SDL: it drives its own frame loop from OpenXR and
+# must stay portable to Android.
+# ==================================================================================================
+
+if (FILAMENT_ENABLE_OPENXR)
+    include_directories(${GENERATION_ROOT})
+    add_executable(helloxr helloxr.cpp)
+    target_compile_options(helloxr PRIVATE ${COMPILER_FLAGS})
+    target_link_libraries(helloxr PRIVATE
+        filament
+        bluevk
+        filameshio
+        ktxreader
+        sample-resources
+        suzanne-resources
+        openxr_loader
+    )
+    set_target_properties(helloxr PROPERTIES FOLDER Samples)
+endif()
+
+# ==================================================================================================
 # Copy Assets
 #
 # This creates a structure like:

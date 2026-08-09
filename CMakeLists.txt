@@ -81,6 +81,11 @@ option(FILAMENT_ENABLE_COVERAGE "Enable LLVM code coverage" OFF)
 
 option(FILAMENT_ENABLE_MULTIVIEW "Enable multiview for Filament" OFF)
 
+option(FILAMENT_ENABLE_OPENXR "Build the OpenXR sample (requires Vulkan and multiview)" OFF)
+
+set(FILAMENT_OPENXR_SDK_TAG "release-1.1.62" CACHE STRING
+    "Tag of KhronosGroup/OpenXR-SDK to fetch when FILAMENT_ENABLE_OPENXR is ON")
+
 option(FILAMENT_SUPPORTS_OSMESA "Enable OSMesa (headless GL context) for Filament" OFF)
 
 option(FILAMENT_ENABLE_FGVIEWER "Enable the frame graph viewer" OFF)
@@ -978,6 +983,32 @@ if (FILAMENT_SUPPORTS_VULKAN)
     add_subdirectory(${EXTERNAL}/vkmemalloc/tnt)
     set(SPIRV_HEADERS_SKIP_EXAMPLES ON)
     add_subdirectory(${EXTERNAL}/spirv-headers)
+endif()
+
+# The OpenXR loader is fetched rather than vendored. Keep this block self-contained: an Android
+# port needs to swap it for the vendor-supplied loader (e.g. the Meta OpenXR Mobile SDK).
+if (FILAMENT_ENABLE_OPENXR)
+    if (NOT FILAMENT_SUPPORTS_VULKAN)
+        message(FATAL_ERROR "FILAMENT_ENABLE_OPENXR requires FILAMENT_SUPPORTS_VULKAN=ON")
+    endif()
+    if (NOT FILAMENT_ENABLE_MULTIVIEW)
+        message(FATAL_ERROR
+            "FILAMENT_ENABLE_OPENXR requires multiview; configure with"
+            " -DFILAMENT_SAMPLES_STEREO_TYPE=multiview")
+    endif()
+
+    include(FetchContent)
+    set(DYNAMIC_LOADER OFF CACHE BOOL "" FORCE)
+    set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(BUILD_API_LAYERS OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(openxr_sdk
+        GIT_REPOSITORY https://github.com/KhronosGroup/OpenXR-SDK.git
+        GIT_TAG ${FILAMENT_OPENXR_SDK_TAG}
+        GIT_SHALLOW TRUE
+        EXCLUDE_FROM_ALL
+        SYSTEM
+    )
+    FetchContent_MakeAvailable(openxr_sdk)
 endif()
 
 if (FILAMENT_SUPPORTS_WEBGPU AND NOT WASM)
