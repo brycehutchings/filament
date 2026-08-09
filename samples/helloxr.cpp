@@ -148,6 +148,7 @@ struct Config {
     bool depthLayer = true;
     bool listExtensions = false;
     bool renderModels = true;
+    bool handMeshes = true;
     uint32_t dumpFrame = 0;         // 0 means "never dump"
     std::string dumpPrefix = "helloxr";
 };
@@ -713,11 +714,15 @@ private:
         if (mConfig.renderModels) {
             mFeatures.push_back(helloxr::createRenderModels());
         }
+        if (mConfig.handMeshes) {
+            mFeatures.push_back(helloxr::createHandMeshes());
+        }
     }
 
     // Runs after the scene exists, and drops any feature that cannot set itself up.
     bool initializeFeatures() {
-        helloxr::FeatureContext const context{ mXrInstance, mSession, mAppSpace, mEngine, mScene };
+        helloxr::FeatureContext const context{ mXrInstance, mSession, mAppSpace, mEngine, mScene,
+            mMaterial };
         for (auto& feature: mFeatures) {
             if (!feature) {
                 continue;
@@ -1697,6 +1702,7 @@ void printUsage() {
           "  --no-depth-layer  do not submit depth with the projection layer\n"
           "  --list-extensions log every extension the runtime exposes\n"
           "  --no-render-models  do not draw the runtime's controller models\n"
+          "  --no-hand-meshes  do not draw tracked hand meshes\n"
           "  --help            print this message");
 }
 
@@ -1728,6 +1734,8 @@ bool parseArguments(std::vector<std::string> const& args, Config* config) {
             config->listExtensions = true;
         } else if (arg == "--no-render-models") {
             config->renderModels = false;
+        } else if (arg == "--no-hand-meshes") {
+            config->handMeshes = false;
         } else {
             XRLOG("unknown argument: %s", arg.c_str());
             printUsage();

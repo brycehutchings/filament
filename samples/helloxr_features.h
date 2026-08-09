@@ -58,6 +58,7 @@
 
 namespace filament {
 class Engine;
+class Material;
 class Scene;
 } // namespace filament
 
@@ -70,6 +71,8 @@ struct FeatureContext {
     XrSpace appSpace = XR_NULL_HANDLE;
     filament::Engine* engine = nullptr;
     filament::Scene* scene = nullptr;
+    // The sample's lit material, shared so a module does not have to carry its own copy.
+    filament::Material* material = nullptr;
 };
 
 // An optional capability that renders extra content into the scene. Features are constructed before
@@ -93,6 +96,7 @@ public:
 };
 
 std::unique_ptr<Feature> createRenderModels();
+std::unique_ptr<Feature> createHandMeshes();
 
 filament::math::mat4 poseToMat4(XrPosef const& pose);
 

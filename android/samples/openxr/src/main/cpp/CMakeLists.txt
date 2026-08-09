@@ -33,6 +33,7 @@ endif()
 add_library(helloxr SHARED
     "${REPO_ROOT}/samples/helloxr.cpp"
     "${REPO_ROOT}/samples/helloxr_rendermodel.cpp"
+    "${REPO_ROOT}/samples/helloxr_handmesh.cpp"
     "${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c"
 )
 
