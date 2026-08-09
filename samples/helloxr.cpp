@@ -100,6 +100,8 @@ struct Config {
     double nearPlane = 0.05;
     double farPlane = 100.0;
     bool validation = true;
+    uint32_t dumpFrame = 0;         // 0 means "never dump"
+    std::string dumpPrefix = "helloxr";
 };
 
 char const* xrResultName(XrInstance instance, XrResult result) {
@@ -141,6 +143,10 @@ public:
     };
 
     void setSwapChain(XrSwapChain* swapChain) noexcept { mSwapChain = swapChain; }
+
+    // Asks for the next presented frame to be copied back to the host. Used to verify from the
+    // command line that both multiview layers and the depth buffer really were written.
+    void requestFrameDump(char const* prefix) noexcept { mDumpPrefix = prefix; }
 
     Customization getCustomization() const noexcept override {
         Customization customization;
@@ -186,7 +192,7 @@ public:
         return VK_SUCCESS;
     }
 
-    VkResult present(SwapChainPtr handle, uint32_t, VkSemaphore finishedDrawing) override {
+    VkResult present(SwapChainPtr handle, uint32_t index, VkSemaphore finishedDrawing) override {
         auto* swapChain = static_cast<XrSwapChain*>(handle);
 
         // OpenXR has no way to consume Filament's completion semaphore, and Filament recycles it
@@ -201,6 +207,11 @@ public:
                 .pWaitDstStageMask = &waitStage,
             };
             vkQueueSubmit(getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
+        }
+
+        if (mDumpPrefix != nullptr) {
+            dumpFrame(*swapChain, index);
+            mDumpPrefix = nullptr;
         }
 
         XrSwapchainImageReleaseInfo const releaseInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
@@ -232,7 +243,244 @@ private:
         return XR_SUCCEEDED(xrWaitSwapchainImage(swapChain, &waitInfo));
     }
 
+    uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags properties) const {
+        VkPhysicalDeviceMemoryProperties memoryProperties = {};
+        vkGetPhysicalDeviceMemoryProperties(getPhysicalDevice(), &memoryProperties);
+        for (uint32_t i = 0; i < memoryProperties.memoryTypeCount; ++i) {
+            if ((typeBits & (1u << i)) &&
+                    (memoryProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+                return i;
+            }
+        }
+        return UINT32_MAX;
+    }
+
+    // Copies every array layer of one swapchain image into host memory. The image is put back into
+    // the layout OpenXR expects at release time.
+    std::vector<uint8_t> readBack(VkImage image, VkImageAspectFlags aspect, VkImageLayout layout,
+            VkExtent2D extent, uint32_t layers, uint32_t bytesPerPixel) const {
+        VkDevice const device = getDevice();
+        VkDeviceSize const size = VkDeviceSize(extent.width) * extent.height * bytesPerPixel * layers;
+
+        VkBufferCreateInfo const bufferInfo = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = size,
+            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        };
+        VkBuffer buffer = VK_NULL_HANDLE;
+        if (vkCreateBuffer(device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS) {
+            return {};
+        }
+        VkMemoryRequirements requirements = {};
+        vkGetBufferMemoryRequirements(device, buffer, &requirements);
+        VkMemoryAllocateInfo const allocateInfo = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = requirements.size,
+            .memoryTypeIndex = findMemoryType(requirements.memoryTypeBits,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+        };
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        vkAllocateMemory(device, &allocateInfo, nullptr, &memory);
+        vkBindBufferMemory(device, buffer, memory, 0);
+
+        VkCommandPoolCreateInfo const poolInfo = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+            .queueFamilyIndex = getGraphicsQueueFamilyIndex(),
+        };
+        VkCommandPool pool = VK_NULL_HANDLE;
+        vkCreateCommandPool(device, &poolInfo, nullptr, &pool);
+        VkCommandBufferAllocateInfo const cmdInfo = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = pool,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1,
+        };
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        vkAllocateCommandBuffers(device, &cmdInfo, &cmd);
+
+        VkCommandBufferBeginInfo const beginInfo = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        };
+        vkBeginCommandBuffer(cmd, &beginInfo);
+
+        VkImageMemoryBarrier barrier = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout = layout,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = image,
+            .subresourceRange = { aspect, 0, 1, 0, layers },
+        };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+        VkBufferImageCopy const region = {
+            .imageSubresource = { aspect, 0, 0, layers },
+            .imageExtent = { extent.width, extent.height, 1 },
+        };
+        vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1,
+                &region);
+
+        std::swap(barrier.oldLayout, barrier.newLayout);
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+        vkEndCommandBuffer(cmd);
+
+        VkSubmitInfo const submitInfo = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &cmd,
+        };
+        vkQueueSubmit(getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
+        vkQueueWaitIdle(getGraphicsQueue());
+
+        std::vector<uint8_t> pixels(size);
+        void* mapped = nullptr;
+        vkMapMemory(device, memory, 0, size, 0, &mapped);
+        memcpy(pixels.data(), mapped, size_t(size));
+        vkUnmapMemory(device, memory);
+
+        vkDestroyCommandPool(device, pool, nullptr);
+        vkDestroyBuffer(device, buffer, nullptr);
+        vkFreeMemory(device, memory, nullptr);
+        return pixels;
+    }
+
+    void dumpFrame(XrSwapChain const& swapChain, uint32_t index) const {
+        auto const& bundle = swapChain.bundle;
+        VkExtent2D const extent = bundle.extent;
+        uint32_t const layers = bundle.layerCount;
+        size_t const pixelsPerLayer = size_t(extent.width) * extent.height;
+
+        if (bundle.colorFormat != VK_FORMAT_R8G8B8A8_SRGB &&
+                bundle.colorFormat != VK_FORMAT_R8G8B8A8_UNORM) {
+            XRLOG("frame dump: unsupported color format %d", int(bundle.colorFormat));
+            return;
+        }
+        std::vector<uint8_t> const color = readBack(bundle.colors[index],
+                VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, extent,
+                layers, 4);
+        if (color.empty()) {
+            XRLOG("frame dump: color read back failed");
+            return;
+        }
+
+        size_t differingPixels = 0;
+        std::vector<uint8_t> geometryMask(pixelsPerLayer * layers, 0);
+        for (uint32_t layer = 0; layer < layers; ++layer) {
+            uint8_t const* data = color.data() + layer * pixelsPerLayer * 4;
+            // The corner is always sky, so it doubles as the background reference.
+            uint8_t const* background = data;
+            double luma = 0.0;
+            size_t geometry = 0;
+            double centroidX = 0.0;
+            for (size_t i = 0; i < pixelsPerLayer; ++i) {
+                uint8_t const* pixel = data + i * 4;
+                luma += (pixel[0] + pixel[1] + pixel[2]) / 3.0;
+                int const delta = std::abs(int(pixel[0]) - background[0]) +
+                                  std::abs(int(pixel[1]) - background[1]) +
+                                  std::abs(int(pixel[2]) - background[2]);
+                if (delta > 12) {
+                    geometryMask[layer * pixelsPerLayer + i] = 1;
+                    geometry++;
+                    centroidX += double(i % extent.width);
+                }
+                if (layer > 0 && memcmp(pixel, &color[i * 4], 3) != 0) {
+                    differingPixels++;
+                }
+            }
+            XRLOG("frame dump: eye %u mean luma %.1f, geometry %.1f%%, geometry centroid x %.1f",
+                    layer, luma / double(pixelsPerLayer),
+                    100.0 * geometry / double(pixelsPerLayer),
+                    geometry ? centroidX / double(geometry) : 0.0);
+            writePpm(std::string(mDumpPrefix) + "_eye" + std::to_string(layer) + ".ppm", data,
+                    extent);
+        }
+        if (layers > 1) {
+            XRLOG("frame dump: eyes differ on %.1f%% of pixels (stereo disparity)",
+                    100.0 * differingPixels / double(pixelsPerLayer));
+        }
+
+        if (bundle.depths.empty()) {
+            return;
+        }
+        if (bundle.depthFormat != VK_FORMAT_D32_SFLOAT) {
+            XRLOG("frame dump: unsupported depth format %d", int(bundle.depthFormat));
+            return;
+        }
+        std::vector<uint8_t> const depthBytes = readBack(bundle.depths[index],
+                VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                extent, layers, 4);
+        if (depthBytes.empty()) {
+            XRLOG("frame dump: depth read back failed");
+            return;
+        }
+        auto const* depth = reinterpret_cast<float const*>(depthBytes.data());
+        for (uint32_t layer = 0; layer < layers; ++layer) {
+            float const* data = depth + layer * pixelsPerLayer;
+            uint8_t const* mask = geometryMask.data() + layer * pixelsPerLayer;
+            float minDepth = 1.0f;
+            float maxDepth = 0.0f;
+            size_t written = 0;
+            size_t agree = 0;
+            size_t missing = 0;
+            size_t spurious = 0;
+            double centroidX = 0.0;
+            for (size_t i = 0; i < pixelsPerLayer; ++i) {
+                minDepth = std::min(minDepth, data[i]);
+                maxDepth = std::max(maxDepth, data[i]);
+                // Filament uses reversed-Z, so anything above 0 is closer than the far plane.
+                bool const near = data[i] > 0.0f;
+                written += near ? 1 : 0;
+                if (near) {
+                    centroidX += double(i % extent.width);
+                }
+                agree += (near && mask[i]) ? 1 : 0;
+                missing += (!near && mask[i]) ? 1 : 0;
+                spurious += (near && !mask[i]) ? 1 : 0;
+            }
+            XRLOG("frame dump: eye %u depth range [%.4f, %.4f], %.1f%% closer than far, "
+                  "centroid x %.1f",
+                    layer, minDepth, maxDepth, 100.0 * written / double(pixelsPerLayer),
+                    written ? centroidX / double(written) : 0.0);
+            XRLOG("frame dump: eye %u depth vs color: agree %.1f%%, missing %.1f%%, "
+                  "spurious %.1f%%",
+                    layer, 100.0 * agree / double(pixelsPerLayer),
+                    100.0 * missing / double(pixelsPerLayer),
+                    100.0 * spurious / double(pixelsPerLayer));
+        }
+    }
+
+    static void writePpm(std::string const& path, uint8_t const* rgba, VkExtent2D extent) {
+        FILE* file = fopen(path.c_str(), "wb");
+        if (!file) {
+            return;
+        }
+        fprintf(file, "P6\n%u %u\n255\n", extent.width, extent.height);
+        std::vector<uint8_t> row(size_t(extent.width) * 3);
+        for (uint32_t y = 0; y < extent.height; ++y) {
+            for (uint32_t x = 0; x < extent.width; ++x) {
+                uint8_t const* pixel = rgba + (size_t(y) * extent.width + x) * 4;
+                row[x * 3 + 0] = pixel[0];
+                row[x * 3 + 1] = pixel[1];
+                row[x * 3 + 2] = pixel[2];
+            }
+            fwrite(row.data(), 1, row.size(), file);
+        }
+        fclose(file);
+        XRLOG("frame dump: wrote %s", path.c_str());
+    }
+
     XrSwapChain* mSwapChain = nullptr;
+    char const* mDumpPrefix = nullptr;
 };
 
 // ------------------------------------------------------------------------------------------------
@@ -320,6 +568,10 @@ public:
             renderFrame();
             mFrameCount++;
             framesSinceReport++;
+
+            if (mFrameCount == mConfig.dumpFrame) {
+                mPlatform.requestFrameDump(mConfig.dumpPrefix.c_str());
+            }
 
             double const sinceReport = std::chrono::duration<double>(now - lastReport).count();
             if (sinceReport >= 1.0) {
@@ -715,6 +967,9 @@ private:
 
         XrSwapchainCreateInfo createInfo = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
         createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+        if (mConfig.dumpFrame != 0) {
+            createInfo.usageFlags |= XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT;
+        }
         createInfo.format = colorFormat;
         createInfo.sampleCount = 1;
         createInfo.width = mEyeWidth;
@@ -735,6 +990,9 @@ private:
         std::vector<VkImage> depthImages;
         if (depthFormat != 0) {
             createInfo.usageFlags = XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+            if (mConfig.dumpFrame != 0) {
+                createInfo.usageFlags |= XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT;
+            }
             createInfo.format = depthFormat;
             if (!xrCheck(xrCreateSwapchain(mSession, &createInfo, &mXrSwapChain.depth),
                         "xrCreateSwapchain(depth)")) {
@@ -824,7 +1082,13 @@ private:
         }
         XRLOG("Filament engine created with multiview stereo");
 
-        mFilamentSwapChain = mEngine->createSwapChain(kNativeWindowSentinel);
+        // Without this Filament discards the depth attachment at the end of the render pass and
+        // the runtime would be handed undefined depth.
+        uint64_t swapChainFlags = 0;
+        if (mXrSwapChain.depth != XR_NULL_HANDLE) {
+            swapChainFlags |= filament::SwapChain::CONFIG_PRESERVE_DEPTH_BUFFER;
+        }
+        mFilamentSwapChain = mEngine->createSwapChain(kNativeWindowSentinel, swapChainFlags);
         mRenderer = mEngine->createRenderer();
         return mFilamentSwapChain != nullptr && mRenderer != nullptr;
     }
@@ -1107,6 +1371,8 @@ void printUsage() {
            "  --timeout=S       stop after S seconds, 0 to disable (default: 15)\n"
            "  --near=D          near plane distance in meters (default: 0.05)\n"
            "  --far=D           far plane distance in meters (default: 100)\n"
+           "  --dump-frame=N    read frame N back and report per-eye color and depth stats\n"
+           "  --dump-prefix=P   file name prefix for --dump-frame (default: helloxr)\n"
            "  --no-validation   do not request the Vulkan validation layer\n"
            "  --help            print this message\n");
 }
@@ -1126,6 +1392,10 @@ bool parseArguments(int argc, char** argv, Config* config) {
             config->nearPlane = std::strtod(arg.c_str() + 7, nullptr);
         } else if (startsWith("--far=")) {
             config->farPlane = std::strtod(arg.c_str() + 6, nullptr);
+        } else if (startsWith("--dump-frame=")) {
+            config->dumpFrame = uint32_t(std::strtoul(arg.c_str() + 13, nullptr, 10));
+        } else if (startsWith("--dump-prefix=")) {
+            config->dumpPrefix = arg.substr(14);
         } else if (arg == "--no-validation") {
             config->validation = false;
         } else {
