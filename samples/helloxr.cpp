@@ -43,6 +43,7 @@
 #include <filament/Camera.h>
 #include <filament/Color.h>
 #include <filament/Engine.h>
+#include <filament/IndirectLight.h>
 #include <filament/LightManager.h>
 #include <filament/Material.h>
 #include <filament/MaterialInstance.h>
@@ -56,6 +57,8 @@
 #include <filament/Viewport.h>
 
 #include <filameshio/MeshReader.h>
+
+#include <ktxreader/Ktx1Reader.h>
 
 #include <utils/Entity.h>
 #include <utils/EntityManager.h>
@@ -74,6 +77,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <vector>
@@ -101,6 +106,8 @@ struct Config {
     double farPlane = 100.0;
     bool validation = true;
     bool depthLayer = true;
+    // Prefix of a pair of <prefix>_ibl.ktx / <prefix>_skybox.ktx files, as produced by cmgen.
+    std::string ibl = "assets/ibl/lightroom_14b/lightroom_14b";
     uint32_t dumpFrame = 0;         // 0 means "never dump"
     std::string dumpPrefix = "helloxr";
 };
@@ -503,6 +510,9 @@ public:
         if (mEngine) {
             mEngine->flushAndWait();
             mEngine->destroy(mSkybox);
+            mEngine->destroy(mIndirectLight);
+            mEngine->destroy(mIblTexture);
+            mEngine->destroy(mSkyboxTexture);
             mEngine->destroy(mMonkey.renderable);
             mEngine->destroy(mMonkey.vertexBuffer);
             mEngine->destroy(mMonkey.indexBuffer);
@@ -578,6 +588,10 @@ public:
             framesSinceReport++;
 
             if (mFrameCount == mConfig.dumpFrame) {
+                if (!mConfig.ibl.empty() && mIndirectLight) {
+                    XRLOG("note: the color/depth agreement below assumes a flat skybox; re-run "
+                          "with --ibl= for a meaningful comparison");
+                }
                 mPlatform.requestFrameDump(mConfig.dumpPrefix.c_str());
             }
 
@@ -1156,7 +1170,9 @@ private:
                 .build(*mEngine, mLight);
         mScene->addEntity(mLight);
 
-        mSkybox = Skybox::Builder().color({ 0.06f, 0.07f, 0.10f, 1.0f }).build(*mEngine);
+        if (!loadIbl()) {
+            mSkybox = Skybox::Builder().color({ 0.06f, 0.07f, 0.10f, 1.0f }).build(*mEngine);
+        }
         mScene->setSkybox(mSkybox);
 
         mCameraEntity = em.create();
@@ -1168,6 +1184,50 @@ private:
         mView->setPostProcessingEnabled(false);
         mView->setShadowingEnabled(false);
         mView->setStereoscopicOptions({ .enabled = true });
+        return true;
+    }
+
+    // The only host-filesystem dependency in the sample; an Android port replaces this with an
+    // asset-manager read. Returns false when the files are absent so the caller can fall back.
+    bool loadIbl() {
+        if (mConfig.ibl.empty()) {
+            return false;
+        }
+        auto readFile = [](std::string const& path, std::vector<uint8_t>* out) {
+            std::ifstream file(path, std::ios::binary);
+            if (!file) {
+                return false;
+            }
+            *out = std::vector<uint8_t>((std::istreambuf_iterator<char>(file)),
+                    std::istreambuf_iterator<char>());
+            return !out->empty();
+        };
+
+        std::vector<uint8_t> iblData;
+        std::vector<uint8_t> skyData;
+        if (!readFile(mConfig.ibl + "_ibl.ktx", &iblData) ||
+                !readFile(mConfig.ibl + "_skybox.ktx", &skyData)) {
+            XRLOG("no IBL at '%s'; using a flat skybox", mConfig.ibl.c_str());
+            return false;
+        }
+
+        auto* iblBundle = new image::Ktx1Bundle(iblData.data(), uint32_t(iblData.size()));
+        auto* skyBundle = new image::Ktx1Bundle(skyData.data(), uint32_t(skyData.size()));
+        math::float3 sphericalHarmonics[9];
+        bool const hasHarmonics = iblBundle->getSphericalHarmonics(sphericalHarmonics);
+
+        mIblTexture = ktxreader::Ktx1Reader::createTexture(mEngine, iblBundle, false);
+        mSkyboxTexture = ktxreader::Ktx1Reader::createTexture(mEngine, skyBundle, false);
+
+        auto builder = IndirectLight::Builder().reflections(mIblTexture).intensity(30000.0f);
+        if (hasHarmonics) {
+            builder.irradiance(3, sphericalHarmonics);
+        }
+        mIndirectLight = builder.build(*mEngine);
+        mScene->setIndirectLight(mIndirectLight);
+
+        mSkybox = Skybox::Builder().environment(mSkyboxTexture).showSun(true).build(*mEngine);
+        XRLOG("loaded IBL from '%s'", mConfig.ibl.c_str());
         return true;
     }
 
@@ -1394,6 +1454,9 @@ private:
     View* mView = nullptr;
     Camera* mCamera = nullptr;
     Skybox* mSkybox = nullptr;
+    IndirectLight* mIndirectLight = nullptr;
+    Texture* mIblTexture = nullptr;
+    Texture* mSkyboxTexture = nullptr;
     Material* mMaterial = nullptr;
     MaterialInstance* mMaterialInstance = nullptr;
     filamesh::MeshReader::Mesh mMonkey;
@@ -1421,7 +1484,9 @@ void printUsage() {
            "  --near=D          near plane distance in meters (default: 0.05)\n"
            "  --far=D           far plane distance in meters (default: 100)\n"
            "  --dump-frame=N    read frame N back and report per-eye color and depth stats\n"
+           "                    (the color/depth cross-check assumes --ibl= i.e. a flat skybox)\n"
            "  --dump-prefix=P   file name prefix for --dump-frame (default: helloxr)\n"
+           "  --ibl=PREFIX      load PREFIX_ibl.ktx and PREFIX_skybox.ktx, empty to disable\n"
            "  --no-validation   do not request the Vulkan validation layer\n"
            "  --no-depth-layer  do not submit depth with the projection layer\n"
            "  --help            print this message\n");
@@ -1446,6 +1511,8 @@ bool parseArguments(int argc, char** argv, Config* config) {
             config->dumpFrame = uint32_t(std::strtoul(arg.c_str() + 13, nullptr, 10));
         } else if (startsWith("--dump-prefix=")) {
             config->dumpPrefix = arg.substr(14);
+        } else if (startsWith("--ibl=")) {
+            config->ibl = arg.substr(6);
         } else if (arg == "--no-validation") {
             config->validation = false;
         } else if (arg == "--no-depth-layer") {
