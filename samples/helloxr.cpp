@@ -100,6 +100,7 @@ struct Config {
     double nearPlane = 0.05;
     double farPlane = 100.0;
     bool validation = true;
+    bool depthLayer = true;
     uint32_t dumpFrame = 0;         // 0 means "never dump"
     std::string dumpPrefix = "helloxr";
 };
@@ -256,9 +257,11 @@ private:
     }
 
     // Copies every array layer of one swapchain image into host memory. The image is put back into
-    // the layout OpenXR expects at release time.
-    std::vector<uint8_t> readBack(VkImage image, VkImageAspectFlags aspect, VkImageLayout layout,
-            VkExtent2D extent, uint32_t layers, uint32_t bytesPerPixel) const {
+    // the layout OpenXR expects at release time. A barrier must name every aspect of the format,
+    // while a buffer copy must name exactly one, hence the two masks.
+    std::vector<uint8_t> readBack(VkImage image, VkImageAspectFlags barrierAspect,
+            VkImageAspectFlags copyAspect, VkImageLayout layout, VkExtent2D extent,
+            uint32_t layers, uint32_t bytesPerPixel) const {
         VkDevice const device = getDevice();
         VkDeviceSize const size = VkDeviceSize(extent.width) * extent.height * bytesPerPixel * layers;
 
@@ -315,13 +318,13 @@ private:
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .image = image,
-            .subresourceRange = { aspect, 0, 1, 0, layers },
+            .subresourceRange = { barrierAspect, 0, 1, 0, layers },
         };
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 
         VkBufferImageCopy const region = {
-            .imageSubresource = { aspect, 0, 0, layers },
+            .imageSubresource = { copyAspect, 0, 0, layers },
             .imageExtent = { extent.width, extent.height, 1 },
         };
         vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1,
@@ -366,8 +369,8 @@ private:
             return;
         }
         std::vector<uint8_t> const color = readBack(bundle.colors[index],
-                VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, extent,
-                layers, 4);
+                VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_COLOR_BIT,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, extent, layers, 4);
         if (color.empty()) {
             XRLOG("frame dump: color read back failed");
             return;
@@ -412,11 +415,16 @@ private:
         if (bundle.depths.empty()) {
             return;
         }
-        if (bundle.depthFormat != VK_FORMAT_D32_SFLOAT) {
+        if (bundle.depthFormat != VK_FORMAT_D32_SFLOAT &&
+                bundle.depthFormat != VK_FORMAT_D32_SFLOAT_S8_UINT) {
             XRLOG("frame dump: unsupported depth format %d", int(bundle.depthFormat));
             return;
         }
-        std::vector<uint8_t> const depthBytes = readBack(bundle.depths[index],
+        VkImageAspectFlags depthAspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+        if (bundle.depthFormat == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+            depthAspect |= VK_IMAGE_ASPECT_STENCIL_BIT;
+        }
+        std::vector<uint8_t> const depthBytes = readBack(bundle.depths[index], depthAspect,
                 VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                 extent, layers, 4);
         if (depthBytes.empty()) {
@@ -632,6 +640,16 @@ private:
             return false;
         }
         std::vector<char const*> extensions{ XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME };
+
+        mDepthLayerSupported = supports(XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME);
+        if (!mConfig.depthLayer) {
+            mDepthLayerSupported = false;
+        } else if (mDepthLayerSupported) {
+            extensions.push_back(XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME);
+        } else {
+            XRLOG("warning: runtime does not support %s; submitting color only",
+                    XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME);
+        }
 
         XrInstanceCreateInfo createInfo = { XR_TYPE_INSTANCE_CREATE_INFO };
         snprintf(createInfo.applicationInfo.applicationName,
@@ -952,6 +970,12 @@ private:
             return false;
         }
 
+        std::string formatList;
+        for (int64_t const format: formats) {
+            formatList += std::to_string(format) + " ";
+        }
+        XRLOG("runtime swapchain formats: %s", formatList.c_str());
+
         // Post-processing is disabled under multiview, so Filament writes linear values straight to
         // the attachment and an sRGB target gets the encoding done by the hardware.
         int64_t const colorFormat = selectSwapChainFormat(formats,
@@ -961,8 +985,11 @@ private:
             XRLOG("no supported color swapchain format");
             return false;
         }
+        // A combined depth-stencil format is preferred: once the depth swapchain is submitted for
+        // reprojection the runtime barriers the image itself, and the Meta runtime does so with a
+        // DEPTH|STENCIL aspect mask, which is invalid on a depth-only image.
         int64_t const depthFormat = selectSwapChainFormat(formats,
-                { VK_FORMAT_D32_SFLOAT, VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT,
+                { VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT,
                   VK_FORMAT_D16_UNORM });
 
         XrSwapchainCreateInfo createInfo = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
@@ -1028,6 +1055,8 @@ private:
         XRLOG("swapchain: %u images, color format %d, depth format %d, %u layers",
                 uint32_t(colorImages.size()), int(colorFormat), int(depthFormat),
                 bundle.layerCount);
+        mDepthLayerSupported = mDepthLayerSupported && mXrSwapChain.depth != XR_NULL_HANDLE;
+        XRLOG("depth submission: %s", mDepthLayerSupported ? "enabled" : "disabled");
         mPlatform.setSwapChain(&mXrSwapChain);
         return true;
     }
@@ -1087,6 +1116,10 @@ private:
         uint64_t swapChainFlags = 0;
         if (mXrSwapChain.depth != XR_NULL_HANDLE) {
             swapChainFlags |= filament::SwapChain::CONFIG_PRESERVE_DEPTH_BUFFER;
+        }
+        if (mXrSwapChain.bundle.depthFormat == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+                mXrSwapChain.bundle.depthFormat == VK_FORMAT_D24_UNORM_S8_UINT) {
+            swapChainFlags |= filament::SwapChain::CONFIG_HAS_STENCIL_BUFFER;
         }
         mFilamentSwapChain = mEngine->createSwapChain(kNativeWindowSentinel, swapChainFlags);
         mRenderer = mEngine->createRenderer();
@@ -1216,12 +1249,14 @@ private:
         }
 
         XrCompositionLayerProjectionView projectionViews[kEyeCount] = {};
+        XrCompositionLayerDepthInfoKHR depthInfos[kEyeCount] = {};
         XrCompositionLayerProjection layer = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
         XrCompositionLayerBaseHeader const* layers[1] = {};
         uint32_t layerCount = 0;
 
         if (frameState.shouldRender &&
-                renderLayer(frameState.predictedDisplayTime, projectionViews, &layer)) {
+                renderLayer(frameState.predictedDisplayTime, projectionViews, depthInfos,
+                        &layer)) {
             layers[0] = reinterpret_cast<XrCompositionLayerBaseHeader const*>(&layer);
             layerCount = 1;
         }
@@ -1235,7 +1270,7 @@ private:
     }
 
     bool renderLayer(XrTime displayTime, XrCompositionLayerProjectionView* projectionViews,
-            XrCompositionLayerProjection* layer) {
+            XrCompositionLayerDepthInfoKHR* depthInfos, XrCompositionLayerProjection* layer) {
         XrViewLocateInfo locateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
         locateInfo.viewConfigurationType = kViewConfigType;
         locateInfo.displayTime = displayTime;
@@ -1305,6 +1340,19 @@ private:
                 { int32_t(mEyeWidth), int32_t(mEyeHeight) }
             };
             projectionViews[i].subImage.imageArrayIndex = i;
+
+            if (mDepthLayerSupported && mXrSwapChain.depth != XR_NULL_HANDLE) {
+                depthInfos[i] = { XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR };
+                depthInfos[i].subImage = projectionViews[i].subImage;
+                depthInfos[i].subImage.swapchain = mXrSwapChain.depth;
+                // Filament writes reversed-Z, so minDepth (0) is the far plane and maxDepth (1)
+                // is the near plane. nearZ > farZ is how the spec expects that to be signalled.
+                depthInfos[i].minDepth = 0.0f;
+                depthInfos[i].maxDepth = 1.0f;
+                depthInfos[i].nearZ = float(mConfig.farPlane);
+                depthInfos[i].farZ = float(mConfig.nearPlane);
+                projectionViews[i].next = &depthInfos[i];
+            }
         }
         layer->space = mAppSpace;
         layer->viewCount = kEyeCount;
@@ -1336,6 +1384,7 @@ private:
     VkDevice mVkDevice = VK_NULL_HANDLE;
     uint32_t mGraphicsQueueFamilyIndex = 0;
     bool mDebugUtilsEnabled = false;
+    bool mDepthLayerSupported = false;
 
     XrVulkanPlatform mPlatform;
     Engine* mEngine = nullptr;
@@ -1374,6 +1423,7 @@ void printUsage() {
            "  --dump-frame=N    read frame N back and report per-eye color and depth stats\n"
            "  --dump-prefix=P   file name prefix for --dump-frame (default: helloxr)\n"
            "  --no-validation   do not request the Vulkan validation layer\n"
+           "  --no-depth-layer  do not submit depth with the projection layer\n"
            "  --help            print this message\n");
 }
 
@@ -1398,6 +1448,8 @@ bool parseArguments(int argc, char** argv, Config* config) {
             config->dumpPrefix = arg.substr(14);
         } else if (arg == "--no-validation") {
             config->validation = false;
+        } else if (arg == "--no-depth-layer") {
+            config->depthLayer = false;
         } else {
             printf("unknown argument: %s\n", arg.c_str());
             printUsage();
