@@ -65,6 +65,10 @@ public:
         return (mConfigFlags & CONFIG_HAS_STENCIL_BUFFER) != 0;
     }
 
+    bool preservesDepthBuffer() const noexcept {
+        return (mConfigFlags & CONFIG_PRESERVE_DEPTH_BUFFER) != 0;
+    }
+
     bool isProtected() const noexcept {
         return (mConfigFlags & CONFIG_PROTECTED_CONTENT) != 0;
     }

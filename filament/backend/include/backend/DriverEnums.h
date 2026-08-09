@@ -111,6 +111,13 @@ static constexpr uint64_t SWAP_CHAIN_CONFIG_PROTECTED_CONTENT   = 0x40;
  */
 static constexpr uint64_t SWAP_CHAIN_CONFIG_MSAA_4_SAMPLES      = 0x80;
 
+/**
+ * Indicates that the contents of the SwapChain's depth buffer must survive the render pass.
+ * Filament discards it by default. Set this when something outside Filament consumes the depth
+ * buffer, for instance an OpenXR compositor being handed a depth swapchain.
+ */
+static constexpr uint64_t SWAP_CHAIN_CONFIG_PRESERVE_DEPTH_BUFFER = 0x100;
+
 static constexpr size_t MAX_VERTEX_ATTRIBUTE_COUNT  = 16;   // This is guaranteed by OpenGL ES.
 static constexpr size_t MAX_SAMPLER_COUNT           = 62;   // Maximum needed at feature level 3.
 static constexpr size_t MAX_VERTEX_BUFFER_COUNT     = 16;   // Max number of bound buffer objects.
