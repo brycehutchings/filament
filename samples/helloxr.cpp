@@ -31,17 +31,8 @@
 #endif
 #define XR_USE_GRAPHICS_API_VULKAN
 
-// BlueVK must come first: it pulls in vulkan.h with VK_NO_PROTOTYPES and (on Windows) windows.h,
-// both of which openxr_platform.h expects to already be present.
-#include <bluevk/BlueVK.h>
-
-#if defined(__ANDROID__)
-// openxr_platform.h uses JNI types under XR_USE_PLATFORM_ANDROID but does not include jni.h itself.
-#include <jni.h>
-#endif
-
-#include <openxr/openxr.h>
-#include <openxr/openxr_platform.h>
+// Brings in BlueVK, the OpenXR headers in the right order, and XRLOG.
+#include "helloxr_features.h"
 
 #include <backend/platforms/VulkanPlatform.h>
 
@@ -81,7 +72,6 @@
 #include "generated/resources/monkey.h"
 #include "generated/resources/resources.h"
 #endif
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -140,12 +130,6 @@ bool readAsset(std::string const& name, std::vector<uint8_t>* out) {
 // the pointer itself is never dereferenced because XrVulkanPlatform owns the real swapchain.
 void* const kNativeWindowSentinel = reinterpret_cast<void*>(uintptr_t(1));
 
-#if defined(__ANDROID__)
-#define XRLOG(...) __android_log_print(ANDROID_LOG_INFO, "helloxr", __VA_ARGS__)
-#else
-#define XRLOG(...) do { printf("[helloxr] " __VA_ARGS__); printf("\n"); fflush(stdout); } while (0)
-#endif
-
 struct Config {
     uint32_t frames = 0;            // 0 means "no frame limit"
 #if defined(__ANDROID__)
@@ -163,6 +147,7 @@ struct Config {
     bool validation = true;
     bool depthLayer = true;
     bool listExtensions = false;
+    bool renderModels = true;
     uint32_t dumpFrame = 0;         // 0 means "never dump"
     std::string dumpPrefix = "helloxr";
 };
@@ -604,12 +589,18 @@ private:
 class HelloXr {
 public:
 #if defined(__ANDROID__)
-    HelloXr(Config const& config, android_app* app) : mConfig(config), mApp(app) {}
+    HelloXr(Config const& config, android_app* app) : mConfig(config), mApp(app) { addFeatures(); }
 #else
-    explicit HelloXr(Config const& config) : mConfig(config) {}
+    explicit HelloXr(Config const& config) : mConfig(config) { addFeatures(); }
 #endif
 
     ~HelloXr() {
+        for (auto& feature: mFeatures) {
+            if (feature) {
+                feature->terminate();
+            }
+        }
+        mFeatures.clear();
         if (mEngine) {
             mEngine->flushAndWait();
             mEngine->destroy(mSkybox);
@@ -655,7 +646,7 @@ public:
 
     bool initialize() {
         return createXrInstance() && createVulkanContext() && createSession() &&
-               createSwapChains() && createEngine() && createScene();
+               createSwapChains() && createEngine() && createScene() && initializeFeatures();
     }
 
     void run() {
@@ -718,6 +709,30 @@ public:
     }
 
 private:
+    void addFeatures() {
+        if (mConfig.renderModels) {
+            mFeatures.push_back(helloxr::createRenderModels());
+        }
+    }
+
+    // Runs after the scene exists, and drops any feature that cannot set itself up.
+    bool initializeFeatures() {
+        helloxr::FeatureContext const context{ mXrInstance, mSession, mAppSpace, mEngine, mScene };
+        for (auto& feature: mFeatures) {
+            if (!feature) {
+                continue;
+            }
+            if (feature->initialize(context)) {
+                XRLOG("%s enabled", feature->name());
+            } else {
+                XRLOG("%s disabled: initialization failed", feature->name());
+                feature->terminate();
+                feature.reset();
+            }
+        }
+        return true;
+    }
+
     bool xrCheck(XrResult result, char const* what) const {
         if (XR_SUCCEEDED(result)) {
             return true;
@@ -794,6 +809,19 @@ private:
         } else {
             XRLOG("warning: runtime does not support %s; submitting color only",
                     XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME);
+        }
+
+        // A feature is only kept if the runtime has everything it asked for.
+        for (auto& feature: mFeatures) {
+            auto const needed = feature->requiredExtensions();
+            bool const satisfied = std::all_of(needed.begin(), needed.end(), supports);
+            if (satisfied) {
+                extensions.insert(extensions.end(), needed.begin(), needed.end());
+            } else {
+                XRLOG("%s disabled: the runtime is missing one of its extensions",
+                        feature->name());
+                feature.reset();
+            }
         }
 
         XrInstanceCreateInfo createInfo = { XR_TYPE_INSTANCE_CREATE_INFO };
@@ -1547,6 +1575,12 @@ private:
 
         animate(displayTime);
 
+        for (auto& feature: mFeatures) {
+            if (feature) {
+                feature->update(displayTime);
+            }
+        }
+
         if (!mRenderer->beginFrame(mFilamentSwapChain)) {
             return false;
         }
@@ -1636,6 +1670,7 @@ private:
 
     uint32_t mEyeWidth = 0;
     uint32_t mEyeHeight = 0;
+    std::vector<std::unique_ptr<helloxr::Feature>> mFeatures;
     uint32_t mFrameCount = 0;
     bool mSessionRunning = false;
     bool mExitRequested = false;
@@ -1661,6 +1696,7 @@ void printUsage() {
           "  --no-validation   do not request the Vulkan validation layer\n"
           "  --no-depth-layer  do not submit depth with the projection layer\n"
           "  --list-extensions log every extension the runtime exposes\n"
+          "  --no-render-models  do not draw the runtime's controller models\n"
           "  --help            print this message");
 }
 
@@ -1690,6 +1726,8 @@ bool parseArguments(std::vector<std::string> const& args, Config* config) {
             config->depthLayer = false;
         } else if (arg == "--list-extensions") {
             config->listExtensions = true;
+        } else if (arg == "--no-render-models") {
+            config->renderModels = false;
         } else {
             XRLOG("unknown argument: %s", arg.c_str());
             printUsage();
