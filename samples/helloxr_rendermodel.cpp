@@ -27,6 +27,7 @@
 #include <gltfio/FilamentAsset.h>
 #include <gltfio/MaterialProvider.h>
 #include <gltfio/ResourceLoader.h>
+#include <gltfio/TextureProvider.h>
 
 // The generated ubershader archive sits at a different place in the install tree than in the build
 // tree. Do not try to unify these with an extra -I of the gltfio directory: that puts gltfio/math.h
@@ -75,6 +76,16 @@ public:
         mMaterials = provider;
         mAssetLoader = gltfio::AssetLoader::create({ mContext.engine, provider });
         mResourceLoader = new gltfio::ResourceLoader({ mContext.engine });
+
+        // Without a decoder for every mime type the models use, the resource loader leaves the
+        // material's baseColorMap unbound and the controller renders solid black. Meta's models
+        // arrive as KTX2 through KHR_texture_basisu, so the Basis transcoder is the one that
+        // actually matters here.
+        mStbDecoder = gltfio::createStbProvider(mContext.engine);
+        mKtx2Decoder = gltfio::createKtx2Provider(mContext.engine);
+        mResourceLoader->addTextureProvider("image/png", mStbDecoder);
+        mResourceLoader->addTextureProvider("image/jpeg", mStbDecoder);
+        mResourceLoader->addTextureProvider("image/ktx2", mKtx2Decoder);
 
         // Models are fetched lazily: a runtime only hands out a model key once the matching
         // controller is actually connected, and controllers come and go during a session.
@@ -153,6 +164,10 @@ public:
         }
         delete mResourceLoader;
         mResourceLoader = nullptr;
+        delete mStbDecoder;
+        mStbDecoder = nullptr;
+        delete mKtx2Decoder;
+        mKtx2Decoder = nullptr;
         if (mAssetLoader != nullptr) {
             gltfio::AssetLoader::destroy(&mAssetLoader);
         }
@@ -322,9 +337,18 @@ private:
             return false;
         }
 
+        if (!mContext.dumpPrefix.empty()) {
+            std::string const path = mContext.dumpPrefix + "_controller_" +
+                                     (hand == 0 ? "left" : "right") + ".glb";
+            if (FILE* file = fopen(path.c_str(), "wb")) {
+                fwrite(bytes.data(), 1, bytes.size(), file);
+                fclose(file);
+                XRLOG("render models: wrote %s", path.c_str());
+            }
+        }
+
         gltfio::FilamentAsset* asset =
-                mAssetLoader->createAsset(bytes.data(), uint32_t(bytes.size()));
-        if (asset == nullptr) {
+                mAssetLoader->createAsset(bytes.data(), uint32_t(bytes.size()));        if (asset == nullptr) {
             XRLOG("render models: could not parse the glTF for %s", kModelPaths[hand]);
             mHands[hand].loadFailed = true;
             return false;
@@ -334,8 +358,10 @@ private:
         asset->releaseSourceData();
 
         mHands[hand].asset = asset;
-        XRLOG("render models: %s is '%s' (%u bytes, %zu entities)", kModelPaths[hand],
-                properties.modelName, uint32_t(bytes.size()), size_t(asset->getEntityCount()));
+        XRLOG("render models: %s is '%s' (%u bytes, %zu entities, %zu textures decoded so far)",
+                kModelPaths[hand], properties.modelName, uint32_t(bytes.size()),
+                size_t(asset->getEntityCount()),
+                mStbDecoder->getDecodedCount() + mKtx2Decoder->getDecodedCount());
         return true;
     }
 
@@ -347,6 +373,8 @@ private:
     gltfio::MaterialProvider* mMaterials = nullptr;
     gltfio::AssetLoader* mAssetLoader = nullptr;
     gltfio::ResourceLoader* mResourceLoader = nullptr;
+    gltfio::TextureProvider* mStbDecoder = nullptr;
+    gltfio::TextureProvider* mKtx2Decoder = nullptr;
 
     PFN_xrEnumerateRenderModelPathsFB mEnumeratePaths = nullptr;
     PFN_xrGetRenderModelPropertiesFB mGetProperties = nullptr;

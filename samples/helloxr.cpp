@@ -692,7 +692,7 @@ private:
     // Runs after the scene exists, and drops any feature that cannot set itself up.
     bool initializeFeatures() {
         helloxr::FeatureContext const context{ mXrInstance, mSession, mAppSpace, mEngine, mScene,
-            mMaterial };
+            mMaterial, mConfig.dumpFrame != 0 ? mConfig.dumpPrefix : std::string() };
         for (auto& feature: mFeatures) {
             if (!feature) {
                 continue;

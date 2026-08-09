@@ -74,6 +74,8 @@ struct FeatureContext {
     filament::Scene* scene = nullptr;
     // The sample's lit material, shared so a module does not have to carry its own copy.
     filament::Material* material = nullptr;
+    // When set, modules may write debug artifacts using this as a file name prefix.
+    std::string dumpPrefix;
 };
 
 // An optional capability that renders extra content into the scene. Features are constructed before
