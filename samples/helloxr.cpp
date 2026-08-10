@@ -39,7 +39,6 @@
 #include <filament/Camera.h>
 #include <filament/Color.h>
 #include <filament/Engine.h>
-#include <filament/Fence.h>
 #include <filament/IndirectLight.h>
 #include <filament/LightManager.h>
 #include <filament/Material.h>
@@ -680,8 +679,12 @@ public:
                     XRLOG("note: the color/depth agreement below assumes a flat skybox; re-run "
                           "with --ibl= for a meaningful comparison");
                 }
-                mPlatform.requestFrameDump(mConfig.dumpQuad ? &mQuad : &mXrSwapChain,
-                        mConfig.dumpPrefix.c_str());
+                // The platform reads this on the driver thread, so hand it over in stream order
+                // rather than writing it from here.
+                mEngine->queueDriverCommand([this] {
+                    mPlatform.requestFrameDump(mConfig.dumpQuad ? &mQuad : &mXrSwapChain,
+                            mConfig.dumpPrefix.c_str());
+                });
             }
 
             double const sinceReport = std::chrono::duration<double>(now - lastReport).count();
@@ -1545,6 +1548,11 @@ private:
             }
             case XR_SESSION_STATE_STOPPING:
                 mSessionRunning = false;
+                // A frame may still be queued on the driver thread, and it would be calling into
+                // the session we are about to end.
+                if (mEngine != nullptr) {
+                    mEngine->flushAndWait();
+                }
                 xrCheck(xrEndSession(mSession), "xrEndSession");
                 XRLOG("session stopped");
                 break;
@@ -1567,6 +1575,21 @@ private:
         }
     }
 
+    // Everything xrEndFrame reads, kept alive until the driver thread has submitted the frame.
+    // The poses travel in the same slot as the layers they were rendered for, which is what stops
+    // a pipelined frame from being submitted with a different frame's pose.
+    struct FrameSubmission {
+        XrCompositionLayerProjectionView projectionViews[kEyeCount];
+        XrCompositionLayerDepthInfoKHR depthInfos[kEyeCount];
+        XrCompositionLayerProjection projection;
+        XrCompositionLayerQuad quad;
+        XrCompositionLayerBaseHeader const* layers[2];
+        XrFrameEndInfo endInfo;
+    };
+
+    // OpenXR allows two frames in flight; a third slot keeps the one being written clear of both.
+    static constexpr uint32_t kFramesInFlight = 3;
+
     void renderFrame() {
         XrFrameWaitInfo const waitInfo = { XR_TYPE_FRAME_WAIT_INFO };
         XrFrameState frameState = { XR_TYPE_FRAME_STATE };
@@ -1575,51 +1598,46 @@ private:
             return;
         }
 
-        XrFrameBeginInfo const beginInfo = { XR_TYPE_FRAME_BEGIN_INFO };
-        if (!xrCheck(xrBeginFrame(mSession, &beginInfo), "xrBeginFrame")) {
-            mExitRequested = true;
-            return;
-        }
+        // Both frame calls run on the driver thread, in stream order around the rendering they
+        // bracket. OpenXR forbids submitting on the runtime's queue while they execute, and the
+        // driver thread is the only thing that submits, so running them there is what makes that
+        // hold without the main thread having to wait for anything.
+        mEngine->queueDriverCommand([this] {
+            XrFrameBeginInfo const beginInfo = { XR_TYPE_FRAME_BEGIN_INFO };
+            xrCheck(xrBeginFrame(mSession, &beginInfo), "xrBeginFrame");
+        });
 
-        XrCompositionLayerProjectionView projectionViews[kEyeCount] = {};
-        XrCompositionLayerDepthInfoKHR depthInfos[kEyeCount] = {};
-        XrCompositionLayerProjection layer = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
-        XrCompositionLayerQuad quad = { XR_TYPE_COMPOSITION_LAYER_QUAD };
-        XrCompositionLayerBaseHeader const* layers[2] = {};
+        FrameSubmission& submission = mSubmissions[mFrameCount % kFramesInFlight];
         uint32_t layerCount = 0;
 
         if (frameState.shouldRender) {
-            bool const drewProjection =
-                    renderLayer(frameState.predictedDisplayTime, projectionViews, depthInfos,
-                            &layer);
-            bool const drewQuad = mConfig.quadLayer && renderQuadLayer(&quad);
-            if (drewProjection || drewQuad) {
-                // Waits for the driver thread to reach the release, and no further: OpenXR only
-                // asks that the work has been queued, not that it has finished. Leaving the driver
-                // thread with nothing queued is also what keeps Filament off the shared Vulkan
-                // queue while the runtime submits on it during xrEndFrame.
-                Fence::waitAndDestroy(mEngine->createFence());
+            if (renderLayer(frameState.predictedDisplayTime, submission)) {
+                submission.layers[layerCount++] =
+                        reinterpret_cast<XrCompositionLayerBaseHeader const*>(
+                                &submission.projection);
             }
-            if (drewProjection) {
-                layers[layerCount++] =
-                        reinterpret_cast<XrCompositionLayerBaseHeader const*>(&layer);
-            }
-            if (drewQuad) {
-                layers[layerCount++] =
-                        reinterpret_cast<XrCompositionLayerBaseHeader const*>(&quad);
+            if (mConfig.quadLayer && renderQuadLayer(&submission.quad)) {
+                submission.layers[layerCount++] =
+                        reinterpret_cast<XrCompositionLayerBaseHeader const*>(&submission.quad);
             }
         }
 
-        XrFrameEndInfo endInfo = { XR_TYPE_FRAME_END_INFO };
-        endInfo.displayTime = frameState.predictedDisplayTime;
-        endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-        endInfo.layerCount = layerCount;
-        endInfo.layers = layers;
-        xrCheck(xrEndFrame(mSession, &endInfo), "xrEndFrame");
+        submission.endInfo = { XR_TYPE_FRAME_END_INFO };
+        submission.endInfo.displayTime = frameState.predictedDisplayTime;
+        submission.endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+        submission.endInfo.layerCount = layerCount;
+        submission.endInfo.layers = submission.layers;
+
+        mEngine->queueDriverCommand([this, &submission] {
+            xrCheck(xrEndFrame(mSession, &submission.endInfo), "xrEndFrame");
+        });
+
+        // A frame that rendered nothing never reaches Renderer::endFrame, and an unflushed
+        // xrBeginFrame would strand the next xrWaitFrame forever.
+        mEngine->flush();
     }
 
-    bool renderLayer(XrTime displayTime, XrCompositionLayerProjectionView* projectionViews,
-            XrCompositionLayerDepthInfoKHR* depthInfos, XrCompositionLayerProjection* layer) {
+    bool renderLayer(XrTime displayTime, FrameSubmission& submission) {
         XrViewLocateInfo locateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
         locateInfo.viewConfigurationType = kViewConfigType;
         locateInfo.displayTime = displayTime;
@@ -1683,32 +1701,35 @@ private:
         mRenderer->endFrame();
 
         for (uint32_t i = 0; i < kEyeCount; ++i) {
-            projectionViews[i] = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
-            projectionViews[i].pose = views[i].pose;
-            projectionViews[i].fov = views[i].fov;
-            projectionViews[i].subImage.swapchain = mXrSwapChain.color;
-            projectionViews[i].subImage.imageRect = {
+            XrCompositionLayerProjectionView& view = submission.projectionViews[i];
+            view = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
+            view.pose = views[i].pose;
+            view.fov = views[i].fov;
+            view.subImage.swapchain = mXrSwapChain.color;
+            view.subImage.imageRect = {
                 { 0, 0 },
                 { int32_t(mEyeWidth), int32_t(mEyeHeight) }
             };
-            projectionViews[i].subImage.imageArrayIndex = i;
+            view.subImage.imageArrayIndex = i;
 
             if (mDepthLayerSupported && mXrSwapChain.depth != XR_NULL_HANDLE) {
-                depthInfos[i] = { XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR };
-                depthInfos[i].subImage = projectionViews[i].subImage;
-                depthInfos[i].subImage.swapchain = mXrSwapChain.depth;
+                XrCompositionLayerDepthInfoKHR& depth = submission.depthInfos[i];
+                depth = { XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR };
+                depth.subImage = view.subImage;
+                depth.subImage.swapchain = mXrSwapChain.depth;
                 // Filament writes reversed-Z, so minDepth (0) is the far plane and maxDepth (1)
                 // is the near plane. nearZ > farZ is how the spec expects that to be signalled.
-                depthInfos[i].minDepth = 0.0f;
-                depthInfos[i].maxDepth = 1.0f;
-                depthInfos[i].nearZ = float(mConfig.farPlane);
-                depthInfos[i].farZ = float(mConfig.nearPlane);
-                projectionViews[i].next = &depthInfos[i];
+                depth.minDepth = 0.0f;
+                depth.maxDepth = 1.0f;
+                depth.nearZ = float(mConfig.farPlane);
+                depth.farZ = float(mConfig.nearPlane);
+                view.next = &depth;
             }
         }
-        layer->space = mAppSpace;
-        layer->viewCount = kEyeCount;
-        layer->views = projectionViews;
+        submission.projection = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+        submission.projection.space = mAppSpace;
+        submission.projection.viewCount = kEyeCount;
+        submission.projection.views = submission.projectionViews;
         return true;
     }
 
@@ -1721,6 +1742,7 @@ private:
         mQuadRenderer->render(mQuadView);
         mQuadRenderer->endFrame();
 
+        *quad = { XR_TYPE_COMPOSITION_LAYER_QUAD };
         quad->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
         quad->space = mAppSpace;
         quad->eyeVisibility = XR_EYE_VISIBILITY_BOTH;
@@ -1791,6 +1813,7 @@ private:
     uint32_t mEyeWidth = 0;
     uint32_t mEyeHeight = 0;
     std::vector<std::unique_ptr<helloxr::Feature>> mFeatures;
+    FrameSubmission mSubmissions[kFramesInFlight] = {};
     uint32_t mFrameCount = 0;
     bool mSessionRunning = false;
     bool mExitRequested = false;
