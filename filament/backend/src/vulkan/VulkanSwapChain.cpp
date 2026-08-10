@@ -65,6 +65,7 @@ VulkanSwapChain::VulkanSwapChain(VulkanPlatform* platform, VulkanContext const& 
               platform->getCustomization().transitionSwapChainImageLayoutForPresent),
       mLayerCount(1),
       mSamples((flags & SWAP_CHAIN_CONFIG_MSAA_4_SAMPLES) ? 4 : 1),
+      mPreserveDepth((flags & SWAP_CHAIN_CONFIG_PRESERVE_DEPTH_BUFFER) != 0),
       mCurrentSwapIndex(0),
       mAcquired(false),
       mIsFirstRenderPass(true) {

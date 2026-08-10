@@ -315,8 +315,10 @@ void VulkanRenderTarget::bindSwapChain(fvkmemory::resource_ptr<VulkanSwapChain> 
             mInfo->msaaDepthStencilIndex = (uint8_t) mInfo->attachments.size();
             mInfo->attachments.push_back(msaaDepth);
             fbkey.depthStencil = msaaDepth.getImageView();
-            fbkey.depthStencilResolve = depth.getImageView();
-            rpkey.needsDepthResolve = true;
+            if (swapchain->isDepthPreserved()) {
+                fbkey.depthStencilResolve = depth.getImageView();
+                rpkey.needsDepthResolve = true;
+            }
         }
     } else {
         rpkey.depthStencilFormat = VK_FORMAT_UNDEFINED;

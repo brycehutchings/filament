@@ -98,6 +98,9 @@ struct VulkanSwapChain : public HwSwapChain, fvkmemory::Resource {
         return mMsaaDepth;
     }
 
+    // Resolving depth is only worth it if something is going to read it back.
+    inline bool isDepthPreserved() const noexcept { return mPreserveDepth; }
+
     inline void setFrameScheduledCallback(CallbackHandler* handler,
             FrameScheduledCallback&& callback) noexcept {
         if (!callback) {
@@ -140,6 +143,7 @@ private:
     VkExtent2D mExtent;
     uint32_t mLayerCount;
     uint8_t const mSamples;
+    bool const mPreserveDepth;
     uint32_t mCurrentSwapIndex;
     bool mAcquired;
     bool mIsFirstRenderPass;
