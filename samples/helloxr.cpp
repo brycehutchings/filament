@@ -1120,9 +1120,7 @@ private:
                   VK_FORMAT_D16_UNORM });
 
         XrSwapchainCreateInfo createInfo = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
-        // Filament will only wrap an imported image if it is sampleable.
-        createInfo.usageFlags =
-                XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+        createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
         if (mConfig.dumpFrame != 0) {
             createInfo.usageFlags |= XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT;
         }
@@ -1268,8 +1266,7 @@ private:
                                            .levels(1)
                                            .sampler(Texture::Sampler::SAMPLER_2D_ARRAY)
                                            .format(colorFormat)
-                                           .usage(Texture::Usage::COLOR_ATTACHMENT |
-                                                   Texture::Usage::SAMPLEABLE)
+                                           .usage(Texture::Usage::COLOR_ATTACHMENT)
                                            .build(*mEngine);
             mColorTextures.push_back(color);
 
