@@ -348,7 +348,7 @@ VulkanDriver::VulkanDriver(VulkanPlatform* platform, VulkanContext& context,
                   &mDescriptorSetLayoutCache),
           mStreamedImageManager(&mExternalImageManager),
           mIsSRGBSwapChainSupported(mPlatform->getCustomization().isSRGBSwapChainSupported),
-          mIsMSAASwapChainSupported(false), // TODO: support MSAA swapchain
+          mIsMSAASwapChainSupported(true), // rendered into a sidecar and resolved on pass end
           mAcquireSwapChainInMakeCurrent(
                   driverConfig.featureFlagManager
                           ? driverConfig.featureFlagManager->features.backend.vulkan
@@ -1306,8 +1306,6 @@ void VulkanDriver::createSwapChainR(Handle<HwSwapChain> sch, void* nativeWindow,
     // destroyed before the new swapchain can be created. Otherwise, we would fail
     // vkCreateSwapchainKHR with VK_ERROR_NATIVE_WINDOW_IN_USE_KHR.
     mResourceManager.gc();
-
-    // TODO: support MSAA swapchain
 
     if ((flags & backend::SWAP_CHAIN_CONFIG_SRGB_COLORSPACE) != 0 && !isSRGBSwapChainSupported()) {
         FVK_LOGW << "sRGB swapchain requested, but Platform does not support it";
