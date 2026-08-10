@@ -112,6 +112,7 @@ struct Config {
     double nearPlane = 0.05;
     double farPlane = 100.0;
     uint8_t msaa = 4;               // 1 disables multi-sampling; only 1 and 4 are meaningful
+    uint8_t quadMsaa = 0;           // 0 means "same as msaa"
     bool validation = true;
     bool depthLayer = true;
     bool listExtensions = false;
@@ -1346,16 +1347,27 @@ private:
         }
 
         if (mConfig.quadLayer) {
-            // The quad never hands its depth to the compositor, so it only needs whatever keeps
-            // depth testing working within the pass.
-            uint64_t quadFlags = swapChainFlags & ~filament::SwapChain::CONFIG_PRESERVE_DEPTH_BUFFER;
+            // Sample count travels with the swapchain, so a layer that does not need smooth edges
+            // can skip the cost the projection layer pays. The quad never hands its depth to the
+            // compositor either, so it only needs whatever keeps depth testing working.
+            uint64_t quadFlags = swapChainFlags &
+                                 ~(filament::SwapChain::CONFIG_PRESERVE_DEPTH_BUFFER |
+                                         filament::SwapChain::CONFIG_MSAA_4_SAMPLES);
+            if (quadSamples() > 1) {
+                quadFlags |= filament::SwapChain::CONFIG_MSAA_4_SAMPLES;
+            }
             mQuadSwapChain = mEngine->createSwapChain(&mQuad, quadFlags);
             mQuadRenderer = mEngine->createRenderer();
             if (mQuadSwapChain == nullptr || mQuadRenderer == nullptr) {
                 return false;
             }
+            XRLOG("quad layer: %ux multi-sampling", uint32_t(quadSamples()));
         }
         return true;
+    }
+
+    uint8_t quadSamples() const {
+        return mConfig.quadMsaa != 0 ? mConfig.quadMsaa : mConfig.msaa;
     }
 
     bool createScene() {
@@ -1795,6 +1807,7 @@ void printUsage() {
           "  --near=D          near plane distance in meters (default: 0.05)\n"
           "  --far=D           far plane distance in meters (default: 100)\n"
           "  --msaa=N          multi-sample count, 1 to disable (default: 4)\n"
+          "  --quad-msaa=N     multi-sample count for the quad layer (default: same as --msaa)\n"
           "  --dump-frame=N    read frame N back and report per-eye color and depth stats\n"
           "                    (the color/depth cross-check assumes --ibl= i.e. a flat skybox)\n"
           "  --dump-prefix=P   file name prefix for --dump-frame\n"
@@ -1825,6 +1838,8 @@ bool parseArguments(std::vector<std::string> const& args, Config* config) {
             config->farPlane = std::strtod(arg.c_str() + 6, nullptr);
         } else if (startsWith("--msaa=")) {
             config->msaa = uint8_t(std::strtoul(arg.c_str() + 7, nullptr, 10));
+        } else if (startsWith("--quad-msaa=")) {
+            config->quadMsaa = uint8_t(std::strtoul(arg.c_str() + 12, nullptr, 10));
         } else if (startsWith("--dump-frame=")) {
             config->dumpFrame = uint32_t(std::strtoul(arg.c_str() + 13, nullptr, 10));
         } else if (startsWith("--dump-prefix=")) {
