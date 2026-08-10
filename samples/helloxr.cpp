@@ -114,6 +114,7 @@ struct Config {
 #endif
     double nearPlane = 0.05;
     double farPlane = 100.0;
+    uint8_t msaa = 4;               // 1 disables multi-sampling; only 1 and 4 are meaningful
     bool validation = true;
     bool depthLayer = true;
     bool listExtensions = false;
@@ -1002,6 +1003,22 @@ private:
             deviceExtensions.push_back(VK_KHR_MULTIVIEW_EXTENSION_NAME);
         }
 
+        // Filament resolves the multi-sampled depth buffer into the XR depth image through a
+        // render pass resolve, which only the renderpass2 structures can describe. We create the
+        // device, and Filament skips extension discovery when given a shared context, so these
+        // have to be requested here.
+        if (mConfig.msaa > 1) {
+            for (char const* name: { VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME,
+                         VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME }) {
+                if (!supportsExtension(name)) {
+                    XRLOG("the GPU does not support %s, which %ux MSAA requires", name,
+                            uint32_t(mConfig.msaa));
+                    return false;
+                }
+                deviceExtensions.push_back(name);
+            }
+        }
+
         // One queue, shared with Filament: the runtime synchronizes against the queue named in the
         // graphics binding, so every submission has to land on that same queue.
         float const queuePriority = 1.0f;
@@ -1279,6 +1296,10 @@ private:
         if (mXrSwapChain.bundle.depthFormat == VK_FORMAT_D32_SFLOAT_S8_UINT ||
                 mXrSwapChain.bundle.depthFormat == VK_FORMAT_D24_UNORM_S8_UINT) {
             swapChainFlags |= filament::SwapChain::CONFIG_HAS_STENCIL_BUFFER;
+        }
+        // The XR images stay single-sampled; the backend renders to a sidecar and resolves.
+        if (mConfig.msaa > 1) {
+            swapChainFlags |= filament::SwapChain::CONFIG_MSAA_4_SAMPLES;
         }
         mFilamentSwapChain = mEngine->createSwapChain(kNativeWindowSentinel, swapChainFlags);
         mRenderer = mEngine->createRenderer();
@@ -1664,6 +1685,7 @@ void printUsage() {
           "  --timeout=S       stop after S seconds, 0 to disable\n"
           "  --near=D          near plane distance in meters (default: 0.05)\n"
           "  --far=D           far plane distance in meters (default: 100)\n"
+          "  --msaa=N          multi-sample count, 1 to disable (default: 4)\n"
           "  --dump-frame=N    read frame N back and report per-eye color and depth stats\n"
           "                    (the color/depth cross-check assumes --ibl= i.e. a flat skybox)\n"
           "  --dump-prefix=P   file name prefix for --dump-frame\n"
@@ -1690,6 +1712,8 @@ bool parseArguments(std::vector<std::string> const& args, Config* config) {
             config->nearPlane = std::strtod(arg.c_str() + 7, nullptr);
         } else if (startsWith("--far=")) {
             config->farPlane = std::strtod(arg.c_str() + 6, nullptr);
+        } else if (startsWith("--msaa=")) {
+            config->msaa = uint8_t(std::strtoul(arg.c_str() + 7, nullptr, 10));
         } else if (startsWith("--dump-frame=")) {
             config->dumpFrame = uint32_t(std::strtoul(arg.c_str() + 13, nullptr, 10));
         } else if (startsWith("--dump-prefix=")) {
