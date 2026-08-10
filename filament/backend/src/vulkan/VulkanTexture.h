@@ -174,7 +174,8 @@ struct VulkanTexture : public HwTexture, fvkmemory::Resource {
             VkDeviceMemory memory, VkFormat format, VkSamplerYcbcrConversion conversion,
             VkDeviceMemory stagingMemory, VkBuffer stagingBuffer, Platform::ExternalImageHandle ahBuffer,
             uint8_t levels, uint8_t samples, uint32_t width, uint32_t height, uint32_t depth,
-            TextureUsage tusage, VulkanStagePool& stagePool);
+            TextureUsage tusage, VulkanStagePool& stagePool,
+            TextureFormat tformat = TextureFormat::UNUSED);
 
     // Constructor for creating a texture view for wrt specific mip range
     VulkanTexture(VkDevice device, VkPhysicalDevice physicalDevice, VulkanContext const& context,

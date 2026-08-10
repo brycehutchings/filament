@@ -1035,8 +1035,22 @@ void VulkanDriver::importTextureCommon(Handle<HwTexture> th, intptr_t id,
         SamplerType target, uint8_t levels,
         TextureFormat format, uint8_t samples, uint32_t w, uint32_t h, uint32_t depth,
         TextureUsage usage, utils::ImmutableCString&& tag) {
-    // not supported in this backend
-    assert_invariant(false && "Not supported in Vulkan backend");
+    // The caller owns the image and its memory; we only wrap it so it can be used as an attachment
+    // or sampled from. Layout tracking starts from UNDEFINED, so the first use discards whatever
+    // the image held.
+    auto texture = resource_ptr<VulkanTexture>::make(&mResourceManager, th, mContext,
+            mPlatform->getDevice(), mAllocator, &mResourceManager, &mCommands, (VkImage) id,
+            VK_NULL_HANDLE, fvkutils::getVkFormat(format), VK_NULL_HANDLE, VK_NULL_HANDLE,
+            VK_NULL_HANDLE, Platform::ExternalImageHandle(), levels, samples, w, h, depth, usage,
+            mStagePool, format);
+
+    // Bring the image into the layout Filament assumes it is in, the same way a created texture
+    // does, otherwise the tracked layout and the real one disagree from the first use.
+    VulkanCommandBuffer& commandsBuf = mCommands.get();
+    texture->transitionLayout(&commandsBuf, texture->getPrimaryViewRange(),
+            texture->getDefaultLayout());
+
+    texture.inc();
     mResourceManager.associateHandle(th.getId(), std::move(tag));
 }
 
