@@ -1167,6 +1167,28 @@ public:
     void flush();
 
     /**
+     * Queues a function to be executed on the driver thread, in command stream order.
+     *
+     * The function runs when the driver thread reaches this point in the stream, so it is
+     * ordered against the rendering commands queued around it and it runs on the thread that
+     * submits to the graphics API. That is what makes it usable for work that must interleave
+     * with Filament's own submissions rather than race them, such as the frame boundaries of an
+     * XR runtime sharing our graphics queue.
+     *
+     * The command is only picked up once the command buffer is flushed, which
+     * <code>Renderer::endFrame()</code> and <code>Engine::flush()</code> both do. A queued
+     * command that is never flushed never runs.
+     *
+     * This is not <code>runCommandAsync()</code>, which runs on a worker thread and is ordered
+     * only against other asynchronous calls. Use that one for work that should stay off the
+     * render path, such as asset loading, and this one for work that must be ordered against
+     * rendering.
+     *
+     * @param command The function to run on the driver thread.
+     */
+    void queueDriverCommand(std::function<void()> command);
+
+    /**
      * Get paused state of rendering thread.
      *
      * <p>Warning: This is an experimental API.
