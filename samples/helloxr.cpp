@@ -1638,6 +1638,17 @@ private:
     }
 
     bool renderLayer(XrTime displayTime, FrameSubmission& submission) {
+        // Scene work happens before the head pose is located, not after. The runtime extrapolates
+        // the pose to displayTime, and a sample taken closer to that moment has less to
+        // extrapolate, so it lands nearer the truth. Nothing below reads the camera.
+        animate(displayTime);
+
+        for (auto& feature: mFeatures) {
+            if (feature) {
+                feature->update(displayTime);
+            }
+        }
+
         XrViewLocateInfo locateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
         locateInfo.viewConfigurationType = kViewConfigType;
         locateInfo.displayTime = displayTime;
@@ -1685,14 +1696,6 @@ private:
         mCamera->setCustomEyeProjection(projections, kEyeCount,
                 projectionFromFov(cullingFov, mConfig.nearPlane, mConfig.farPlane),
                 mConfig.nearPlane, mConfig.farPlane);
-
-        animate(displayTime);
-
-        for (auto& feature: mFeatures) {
-            if (feature) {
-                feature->update(displayTime);
-            }
-        }
 
         if (!mRenderer->beginFrame(mFilamentSwapChain)) {
             return false;
