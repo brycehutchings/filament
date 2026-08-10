@@ -91,6 +91,9 @@ tasks.register('compileMaterials') {
     def sourceDir = file("${rootDir}/../../../samples/materials")
     def outputDir = layout.buildDirectory.dir('generated/filamentAssets')
 
+    // matc is an input as much as the sources are: it bakes the engine's uniform block layout
+    // into each package, so a rebuilt engine invalidates every material compiled by the old one.
+    inputs.file matc
     inputs.files materials.collect { new File(sourceDir, "${it}.mat") }
     outputs.files materials.collect { outputDir.get().file("${it}.filamat").asFile }
 
