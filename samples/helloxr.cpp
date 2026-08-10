@@ -95,10 +95,7 @@ namespace {
 
 constexpr uint32_t kEyeCount = 2;
 constexpr XrViewConfigurationType kViewConfigType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-
-// Filament treats a swapchain with no native window as headless and then never calls present();
-// the pointer itself is never dereferenced because XrVulkanPlatform owns the real swapchain.
-void* const kNativeWindowSentinel = reinterpret_cast<void*>(uintptr_t(1));
+constexpr uint32_t kQuadSize = 1024;
 
 struct Config {
     uint32_t frames = 0;            // 0 means "no frame limit"
@@ -120,6 +117,8 @@ struct Config {
     bool listExtensions = false;
     bool renderModels = true;
     bool handMeshes = true;
+    bool quadLayer = true;
+    bool dumpQuad = false;          // dump the quad layer instead of the projection layer
     uint32_t dumpFrame = 0;         // 0 means "never dump"
     std::string dumpPrefix = "helloxr";
 };
@@ -161,11 +160,13 @@ public:
         SwapChainBundle bundle;
     };
 
-    void setSwapChain(XrSwapChain* swapChain) noexcept { mSwapChain = swapChain; }
-
-    // Asks for the next presented frame to be copied back to the host. Used to verify from the
-    // command line that both multiview layers and the depth buffer really were written.
-    void requestFrameDump(char const* prefix) noexcept { mDumpPrefix = prefix; }
+    // Asks for the next presented frame of one swapchain to be copied back to the host. Used to
+    // verify from the command line that both multiview layers and the depth buffer really were
+    // written.
+    void requestFrameDump(XrSwapChain const* target, char const* prefix) noexcept {
+        mDumpTarget = target;
+        mDumpPrefix = prefix;
+    }
 
     Customization getCustomization() const noexcept override {
         Customization customization;
@@ -178,7 +179,11 @@ public:
         return static_cast<XrSwapChain*>(handle)->bundle;
     }
 
-    SwapChainPtr createSwapChain(void*, uint64_t, VkExtent2D) override { return mSwapChain; }
+    // The pointer handed to Engine::createSwapChain() is the XR swapchain to render into, which is
+    // what lets a projection layer and a quad layer each have their own.
+    SwapChainPtr createSwapChain(void* nativeWindow, uint64_t, VkExtent2D) override {
+        return static_cast<XrSwapChain*>(nativeWindow);
+    }
 
     void destroy(SwapChainPtr) override {} // the XR swapchains outlive the Engine
 
@@ -228,9 +233,10 @@ public:
             vkQueueSubmit(getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
         }
 
-        if (mDumpPrefix != nullptr) {
+        if (mDumpPrefix != nullptr && swapChain == mDumpTarget) {
             dumpFrame(*swapChain, index);
             mDumpPrefix = nullptr;
+            mDumpTarget = nullptr;
         }
 
         XrSwapchainImageReleaseInfo const releaseInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
@@ -550,7 +556,7 @@ private:
         XRLOG("frame dump: wrote %s", path.c_str());
     }
 
-    XrSwapChain* mSwapChain = nullptr;
+    XrSwapChain const* mDumpTarget = nullptr;
     char const* mDumpPrefix = nullptr;
 };
 
@@ -589,9 +595,16 @@ public:
             mEngine->destroy(mScene);
             mEngine->destroy(mRenderer);
             mEngine->destroy(mFilamentSwapChain);
+            if (mQuadView != nullptr) {
+                mEngine->destroy(mQuadView);
+                mEngine->destroy(mQuadRenderer);
+                mEngine->destroy(mQuadSwapChain);
+                mEngine->destroyCameraComponent(mQuadCameraEntity);
+            }
             mEngine->destroyCameraComponent(mCameraEntity);
             auto& em = utils::EntityManager::get();
             em.destroy(mCameraEntity);
+            em.destroy(mQuadCameraEntity);
             em.destroy(mLight);
             Engine::destroy(&mEngine);
         }
@@ -600,6 +613,12 @@ public:
         }
         if (mXrSwapChain.depth != XR_NULL_HANDLE) {
             xrDestroySwapchain(mXrSwapChain.depth);
+        }
+        if (mQuad.color != XR_NULL_HANDLE) {
+            xrDestroySwapchain(mQuad.color);
+        }
+        if (mQuad.depth != XR_NULL_HANDLE) {
+            xrDestroySwapchain(mQuad.depth);
         }
         if (mAppSpace != XR_NULL_HANDLE) {
             xrDestroySpace(mAppSpace);
@@ -659,7 +678,8 @@ public:
                     XRLOG("note: the color/depth agreement below assumes a flat skybox; re-run "
                           "with --ibl= for a meaningful comparison");
                 }
-                mPlatform.requestFrameDump(mConfig.dumpPrefix.c_str());
+                mPlatform.requestFrameDump(mConfig.dumpQuad ? &mQuad : &mXrSwapChain,
+                        mConfig.dumpPrefix.c_str());
             }
 
             double const sinceReport = std::chrono::duration<double>(now - lastReport).count();
@@ -1154,54 +1174,77 @@ private:
 
         // Post-processing is disabled under multiview, so Filament writes linear values straight to
         // the attachment and an sRGB target gets the encoding done by the hardware.
-        int64_t const colorFormat = selectSwapChainFormat(formats,
+        mColorFormat = selectSwapChainFormat(formats,
                 { VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM,
                   VK_FORMAT_B8G8R8A8_UNORM });
-        if (colorFormat == 0) {
+        if (mColorFormat == 0) {
             XRLOG("no supported color swapchain format");
             return false;
         }
         // A combined depth-stencil format is preferred: once the depth swapchain is submitted for
         // reprojection the runtime barriers the image itself, and the Meta runtime does so with a
         // DEPTH|STENCIL aspect mask, which is invalid on a depth-only image.
-        int64_t const depthFormat = selectSwapChainFormat(formats,
+        mDepthFormat = selectSwapChainFormat(formats,
                 { VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT,
                   VK_FORMAT_D16_UNORM });
+        if (mDepthFormat == 0) {
+            XRLOG("the runtime exposes no depth format; rendering without a depth buffer");
+        }
 
+        if (!createXrSwapChain(&mXrSwapChain, mEyeWidth, mEyeHeight, kEyeCount)) {
+            return false;
+        }
+        mDepthLayerSupported = mDepthLayerSupported && mXrSwapChain.depth != XR_NULL_HANDLE;
+        XRLOG("depth submission: %s", mDepthLayerSupported ? "enabled" : "disabled");
+
+        // A flat panel the compositor samples at its own resolution, which is why it is worth a
+        // layer of its own rather than a quad inside the scene.
+        if (mConfig.quadLayer && !createXrSwapChain(&mQuad, kQuadSize, kQuadSize, 1)) {
+            return false;
+        }
+        return true;
+    }
+
+    // Every one of these becomes its own Filament SwapChain, so another composition layer only
+    // needs another call.
+    bool createXrSwapChain(XrVulkanPlatform::XrSwapChain* out, uint32_t width, uint32_t height,
+            uint32_t arraySize) {
         XrSwapchainCreateInfo createInfo = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
         createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
         if (mConfig.dumpFrame != 0) {
             createInfo.usageFlags |= XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT;
         }
-        createInfo.format = colorFormat;
+        createInfo.format = mColorFormat;
         createInfo.sampleCount = 1;
-        createInfo.width = mEyeWidth;
-        createInfo.height = mEyeHeight;
+        createInfo.width = width;
+        createInfo.height = height;
         createInfo.faceCount = 1;
-        createInfo.arraySize = kEyeCount;
+        createInfo.arraySize = arraySize;
         createInfo.mipCount = 1;
-        if (!xrCheck(xrCreateSwapchain(mSession, &createInfo, &mXrSwapChain.color),
+        if (!xrCheck(xrCreateSwapchain(mSession, &createInfo, &out->color),
                     "xrCreateSwapchain(color)")) {
             return false;
         }
 
         std::vector<VkImage> colorImages;
-        if (!enumerateSwapChainImages(mXrSwapChain.color, &colorImages)) {
+        if (!enumerateSwapChainImages(out->color, &colorImages)) {
             return false;
         }
 
+        // Even a layer that never submits depth needs one, otherwise Filament has nothing to
+        // depth test against.
         std::vector<VkImage> depthImages;
-        if (depthFormat != 0) {
+        if (mDepthFormat != 0) {
             createInfo.usageFlags = XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
             if (mConfig.dumpFrame != 0) {
                 createInfo.usageFlags |= XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT;
             }
-            createInfo.format = depthFormat;
-            if (!xrCheck(xrCreateSwapchain(mSession, &createInfo, &mXrSwapChain.depth),
+            createInfo.format = mDepthFormat;
+            if (!xrCheck(xrCreateSwapchain(mSession, &createInfo, &out->depth),
                         "xrCreateSwapchain(depth)")) {
                 return false;
             }
-            if (!enumerateSwapChainImages(mXrSwapChain.depth, &depthImages)) {
+            if (!enumerateSwapChainImages(out->depth, &depthImages)) {
                 return false;
             }
             if (depthImages.size() != colorImages.size()) {
@@ -1209,11 +1252,9 @@ private:
                         colorImages.size(), depthImages.size());
                 return false;
             }
-        } else {
-            XRLOG("the runtime exposes no depth format; rendering without a depth buffer");
         }
 
-        auto& bundle = mXrSwapChain.bundle;
+        auto& bundle = out->bundle;
         bundle.colors = utils::FixedCapacityVector<VkImage>::with_capacity(colorImages.size());
         for (VkImage const image: colorImages) {
             bundle.colors.push_back(image);
@@ -1222,18 +1263,15 @@ private:
         for (VkImage const image: depthImages) {
             bundle.depths.push_back(image);
         }
-        bundle.colorFormat = VkFormat(colorFormat);
-        bundle.depthFormat = VkFormat(depthFormat);
-        bundle.extent = { mEyeWidth, mEyeHeight };
-        // This is what makes Filament build a multiview default render target.
-        bundle.layerCount = kEyeCount;
+        bundle.colorFormat = VkFormat(mColorFormat);
+        bundle.depthFormat = VkFormat(mDepthFormat);
+        bundle.extent = { width, height };
+        // Anything above one is what makes Filament build a multiview render target.
+        bundle.layerCount = arraySize;
 
-        XRLOG("swapchain: %u images, color format %d, depth format %d, %u layers",
-                uint32_t(colorImages.size()), int(colorFormat), int(depthFormat),
-                bundle.layerCount);
-        mDepthLayerSupported = mDepthLayerSupported && mXrSwapChain.depth != XR_NULL_HANDLE;
-        XRLOG("depth submission: %s", mDepthLayerSupported ? "enabled" : "disabled");
-        mPlatform.setSwapChain(&mXrSwapChain);
+        XRLOG("swapchain: %ux%u, %u images, %u layers, color format %d, depth format %d", width,
+                height, uint32_t(colorImages.size()), arraySize, int(mColorFormat),
+                int(mDepthFormat));
         return true;
     }
 
@@ -1301,9 +1339,23 @@ private:
         if (mConfig.msaa > 1) {
             swapChainFlags |= filament::SwapChain::CONFIG_MSAA_4_SAMPLES;
         }
-        mFilamentSwapChain = mEngine->createSwapChain(kNativeWindowSentinel, swapChainFlags);
+        mFilamentSwapChain = mEngine->createSwapChain(&mXrSwapChain, swapChainFlags);
         mRenderer = mEngine->createRenderer();
-        return mFilamentSwapChain != nullptr && mRenderer != nullptr;
+        if (mFilamentSwapChain == nullptr || mRenderer == nullptr) {
+            return false;
+        }
+
+        if (mConfig.quadLayer) {
+            // The quad never hands its depth to the compositor, so it only needs whatever keeps
+            // depth testing working within the pass.
+            uint64_t quadFlags = swapChainFlags & ~filament::SwapChain::CONFIG_PRESERVE_DEPTH_BUFFER;
+            mQuadSwapChain = mEngine->createSwapChain(&mQuad, quadFlags);
+            mQuadRenderer = mEngine->createRenderer();
+            if (mQuadSwapChain == nullptr || mQuadRenderer == nullptr) {
+                return false;
+            }
+        }
+        return true;
     }
 
     bool createScene() {
@@ -1365,6 +1417,24 @@ private:
         mView->setPostProcessingEnabled(false);
         mView->setShadowingEnabled(false);
         mView->setStereoscopicOptions({ .enabled = true });
+
+        if (mConfig.quadLayer) {
+            // The same scene from a fixed viewpoint, so the panel shows something recognisable
+            // without needing assets of its own. Stereo has to be off: the quad swapchain has a
+            // single layer, so a two-eye pass would have nowhere to put the second view.
+            mQuadCameraEntity = em.create();
+            mQuadCamera = mEngine->createCamera(mQuadCameraEntity);
+            mQuadCamera->setProjection(60.0, 1.0, 0.1, 20.0, Camera::Fov::VERTICAL);
+            mQuadCamera->lookAt({ 1.5f, 0.8f, -1.0f }, { 0.0f, 0.0f, -2.0f }, { 0.0f, 1.0f, 0.0f });
+
+            mQuadView = mEngine->createView();
+            mQuadView->setScene(mScene);
+            mQuadView->setCamera(mQuadCamera);
+            mQuadView->setViewport({ 0, 0, kQuadSize, kQuadSize });
+            mQuadView->setPostProcessingEnabled(false);
+            mQuadView->setShadowingEnabled(false);
+            mQuadView->setStereoscopicOptions({ .enabled = false });
+        }
         return true;
     }
 
@@ -1501,14 +1571,28 @@ private:
         XrCompositionLayerProjectionView projectionViews[kEyeCount] = {};
         XrCompositionLayerDepthInfoKHR depthInfos[kEyeCount] = {};
         XrCompositionLayerProjection layer = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
-        XrCompositionLayerBaseHeader const* layers[1] = {};
+        XrCompositionLayerQuad quad = { XR_TYPE_COMPOSITION_LAYER_QUAD };
+        XrCompositionLayerBaseHeader const* layers[2] = {};
         uint32_t layerCount = 0;
 
-        if (frameState.shouldRender &&
-                renderLayer(frameState.predictedDisplayTime, projectionViews, depthInfos,
-                        &layer)) {
-            layers[0] = reinterpret_cast<XrCompositionLayerBaseHeader const*>(&layer);
-            layerCount = 1;
+        if (frameState.shouldRender) {
+            bool const drewProjection =
+                    renderLayer(frameState.predictedDisplayTime, projectionViews, depthInfos,
+                            &layer);
+            bool const drewQuad = mConfig.quadLayer && renderQuadLayer(&quad);
+            if (drewProjection || drewQuad) {
+                // The driver thread is what releases the images back to the runtime, so it has to
+                // have caught up before the layers referencing them are submitted.
+                mEngine->flushAndWait();
+            }
+            if (drewProjection) {
+                layers[layerCount++] =
+                        reinterpret_cast<XrCompositionLayerBaseHeader const*>(&layer);
+            }
+            if (drewQuad) {
+                layers[layerCount++] =
+                        reinterpret_cast<XrCompositionLayerBaseHeader const*>(&quad);
+            }
         }
 
         XrFrameEndInfo endInfo = { XR_TYPE_FRAME_END_INFO };
@@ -1582,9 +1666,6 @@ private:
         }
         mRenderer->render(mView);
         mRenderer->endFrame();
-        // The driver thread is what calls xrAcquire/Wait/ReleaseSwapchainImage, so it has to finish
-        // before xrEndFrame.
-        mEngine->flushAndWait();
 
         for (uint32_t i = 0; i < kEyeCount; ++i) {
             projectionViews[i] = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
@@ -1616,8 +1697,28 @@ private:
         return true;
     }
 
-    void animate(XrTime displayTime) {
-        float const seconds = float(double(displayTime) * 1e-9);
+    // A second XR swapchain driven through its own Filament SwapChain, which only works because
+    // the platform hands back whichever one it was given.
+    bool renderQuadLayer(XrCompositionLayerQuad* quad) {
+        if (!mQuadRenderer->beginFrame(mQuadSwapChain)) {
+            return false;
+        }
+        mQuadRenderer->render(mQuadView);
+        mQuadRenderer->endFrame();
+
+        quad->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+        quad->space = mAppSpace;
+        quad->eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        quad->subImage.swapchain = mQuad.color;
+        quad->subImage.imageRect = { { 0, 0 }, { int32_t(kQuadSize), int32_t(kQuadSize) } };
+        quad->subImage.imageArrayIndex = 0;
+        quad->pose.orientation = { 0.0f, 0.0f, 0.0f, 1.0f };
+        quad->pose.position = { -0.7f, 0.0f, -1.5f };
+        quad->size = { 0.5f, 0.5f };
+        return true;
+    }
+
+    void animate(XrTime displayTime) {        float const seconds = float(double(displayTime) * 1e-9);
         auto& tcm = mEngine->getTransformManager();
         mat4f const transform = mat4f::translation(float3{ 0.0f, 0.0f, -2.0f }) *
                                 mat4f::rotation(seconds, float3{ 0.0f, 1.0f, 0.0f });
@@ -1634,6 +1735,9 @@ private:
     XrSessionState mSessionState = XR_SESSION_STATE_UNKNOWN;
     XrViewConfigurationView mViewConfigs[kEyeCount] = {};
     XrVulkanPlatform::XrSwapChain mXrSwapChain;
+    XrVulkanPlatform::XrSwapChain mQuad;
+    int64_t mColorFormat = 0;
+    int64_t mDepthFormat = 0;
 
     VkInstance mVkInstance = VK_NULL_HANDLE;
     VkPhysicalDevice mVkPhysicalDevice = VK_NULL_HANDLE;
@@ -1646,6 +1750,11 @@ private:
     Engine* mEngine = nullptr;
     Renderer* mRenderer = nullptr;
     filament::SwapChain* mFilamentSwapChain = nullptr;
+    filament::SwapChain* mQuadSwapChain = nullptr;
+    Renderer* mQuadRenderer = nullptr;
+    View* mQuadView = nullptr;
+    Camera* mQuadCamera = nullptr;
+    utils::Entity mQuadCameraEntity;
     Scene* mScene = nullptr;
     View* mView = nullptr;
     Camera* mCamera = nullptr;
@@ -1695,6 +1804,8 @@ void printUsage() {
           "  --list-extensions log every extension the runtime exposes\n"
           "  --no-render-models  do not draw the runtime's controller models\n"
           "  --no-hand-meshes  do not draw tracked hand meshes\n"
+          "  --no-quad-layer   do not submit the second composition layer\n"
+          "  --dump-quad       dump the quad layer rather than the projection layer\n"
           "  --help            print this message");
 }
 
@@ -1730,6 +1841,10 @@ bool parseArguments(std::vector<std::string> const& args, Config* config) {
             config->renderModels = false;
         } else if (arg == "--no-hand-meshes") {
             config->handMeshes = false;
+        } else if (arg == "--no-quad-layer") {
+            config->quadLayer = false;
+        } else if (arg == "--dump-quad") {
+            config->dumpQuad = true;
         } else {
             XRLOG("unknown argument: %s", arg.c_str());
             printUsage();
