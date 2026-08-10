@@ -412,6 +412,10 @@ VulkanRenderTarget::VulkanRenderTarget(VkDevice device, VkPhysicalDevice physica
                 };
                 attachments.push_back(msaaAttachment);
                 fbkey.depthStencil = msaaAttachment.getImageView();
+                // Keep the single-sampled image as the resolve target, otherwise everything drawn
+                // into the multi-sampled sidecar is thrown away at the end of the pass.
+                fbkey.depthStencilResolve = depthStencil.getImageView();
+                rpkey.needsDepthResolve = true;
             }
         }
     }

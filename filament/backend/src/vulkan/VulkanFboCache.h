@@ -57,7 +57,8 @@ public:
         uint8_t usesLazilyAllocatedMemory; // 1 byte
         uint8_t subpassMask; // 1 byte
         uint8_t viewCount; // 1 byte
-        uint8_t padding[2];
+        uint8_t needsDepthResolve; // 1 byte
+        uint8_t padding[1];
     };
     struct RenderPassVal {
         fvkmemory::resource_ptr<VulkanRenderPass> handle;
@@ -84,6 +85,7 @@ public:
         VkImageView color[MRT::MAX_SUPPORTED_RENDER_TARGET_COUNT]; // 64 bytes
         VkImageView resolve[MRT::MAX_SUPPORTED_RENDER_TARGET_COUNT]; // 64 bytes
         VkImageView depthStencil; // 8 bytes
+        VkImageView depthStencilResolve; // 8 bytes
     };
     struct FboVal {
         fvkmemory::resource_ptr<VulkanFramebuffer> handle;
@@ -91,7 +93,7 @@ public:
     };
     static_assert(sizeof(VkRenderPass) == 8, "VkRenderPass has unexpected size.");
     static_assert(sizeof(VkImageView) == 8, "VkImageView has unexpected size.");
-    static_assert(sizeof(FboKey) == 152, "FboKey has unexpected size.");
+    static_assert(sizeof(FboKey) == 160, "FboKey has unexpected size.");
     using FboKeyHashFn = utils::hash::MurmurHashFn<FboKey>;
     struct FboKeyEqualFn {
         bool operator()(const FboKey& k1, const FboKey& k2) const;
