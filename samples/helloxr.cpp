@@ -39,6 +39,7 @@
 #include <filament/Camera.h>
 #include <filament/Color.h>
 #include <filament/Engine.h>
+#include <filament/Fence.h>
 #include <filament/IndirectLight.h>
 #include <filament/LightManager.h>
 #include <filament/Material.h>
@@ -1593,9 +1594,11 @@ private:
                             &layer);
             bool const drewQuad = mConfig.quadLayer && renderQuadLayer(&quad);
             if (drewProjection || drewQuad) {
-                // The driver thread is what releases the images back to the runtime, so it has to
-                // have caught up before the layers referencing them are submitted.
-                mEngine->flushAndWait();
+                // Waits for the driver thread to reach the release, and no further: OpenXR only
+                // asks that the work has been queued, not that it has finished. Leaving the driver
+                // thread with nothing queued is also what keeps Filament off the shared Vulkan
+                // queue while the runtime submits on it during xrEndFrame.
+                Fence::waitAndDestroy(mEngine->createFence());
             }
             if (drewProjection) {
                 layers[layerCount++] =
