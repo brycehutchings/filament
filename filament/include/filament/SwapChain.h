@@ -253,6 +253,20 @@ public:
     static constexpr uint64_t CONFIG_MSAA_4_SAMPLES = backend::SWAP_CHAIN_CONFIG_MSAA_4_SAMPLES;
 
     /**
+     * Preserve the contents of the SwapChain's depth buffer past the end of the render pass.
+     *
+     * Filament discards the depth attachment of the default render target once a frame is drawn,
+     * which leaves its contents undefined. Set this flag when something outside Filament reads the
+     * depth buffer, for example an OpenXR compositor that was handed a depth swapchain for
+     * reprojection.
+     *
+     * Note that the depth values follow Filament's reversed-Z convention: 1 at the near plane and
+     * 0 at the far plane.
+     */
+    static constexpr uint64_t CONFIG_PRESERVE_DEPTH_BUFFER =
+            backend::SWAP_CHAIN_CONFIG_PRESERVE_DEPTH_BUFFER;
+
+    /**
      * Return whether createSwapChain supports the CONFIG_PROTECTED_CONTENT flag.
      * The default implementation returns false.
      *

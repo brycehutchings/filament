@@ -28,6 +28,27 @@ using namespace utils;
 
 namespace filament::backend {
 
+namespace {
+
+// Swapchain images are wrapped without a backend format (they are created from a VkFormat), but
+// allocating a multi-sampled sidecar to match one needs it back. Only the formats a swapchain can
+// actually be created with are worth handling.
+bool toTextureFormat(VkFormat format, TextureFormat* out) {
+    switch (format) {
+        case VK_FORMAT_R8G8B8A8_SRGB: *out = TextureFormat::SRGB8_A8; return true;
+        case VK_FORMAT_R8G8B8A8_UNORM: *out = TextureFormat::RGBA8; return true;
+        case VK_FORMAT_A2B10G10R10_UNORM_PACK32: *out = TextureFormat::RGB10_A2; return true;
+        case VK_FORMAT_R16G16B16A16_SFLOAT: *out = TextureFormat::RGBA16F; return true;
+        case VK_FORMAT_D16_UNORM: *out = TextureFormat::DEPTH16; return true;
+        case VK_FORMAT_D32_SFLOAT: *out = TextureFormat::DEPTH32F; return true;
+        case VK_FORMAT_D24_UNORM_S8_UINT: *out = TextureFormat::DEPTH24_STENCIL8; return true;
+        case VK_FORMAT_D32_SFLOAT_S8_UINT: *out = TextureFormat::DEPTH32F_STENCIL8; return true;
+        default: return false;
+    }
+}
+
+} // anonymous namespace
+
 VulkanSwapChain::VulkanSwapChain(VulkanPlatform* platform, VulkanContext const& context,
         fvkmemory::ResourceManager* resourceManager, VmaAllocator allocator,
         VulkanCommands* commands, VulkanStagePool& stagePool, void* nativeWindow, uint64_t flags,
@@ -43,6 +64,8 @@ VulkanSwapChain::VulkanSwapChain(VulkanPlatform* platform, VulkanContext const& 
       mTransitionSwapChainImageLayoutForPresent(
               platform->getCustomization().transitionSwapChainImageLayoutForPresent),
       mLayerCount(1),
+      mSamples((flags & SWAP_CHAIN_CONFIG_MSAA_4_SAMPLES) ? 4 : 1),
+      mPreserveDepth((flags & SWAP_CHAIN_CONFIG_PRESERVE_DEPTH_BUFFER) != 0),
       mCurrentSwapIndex(0),
       mAcquired(false),
       mIsFirstRenderPass(true) {
@@ -59,7 +82,9 @@ VulkanSwapChain::~VulkanSwapChain() {
     mCommands->wait();
 
     mColors = {};
-    mDepth = {};
+    mDepths = {};
+    mMsaaColor = {};
+    mMsaaDepth = {};
     for (auto& semaphore : mFinishedDrawing) {
         semaphore = {};
     }
@@ -69,6 +94,7 @@ VulkanSwapChain::~VulkanSwapChain() {
 
 void VulkanSwapChain::update() {
     mColors.clear();
+    mDepths.clear();
 
     auto const bundle = mPlatform->getSwapChainBundle(swapChain);
     size_t const swapChainCount = bundle.colors.size();
@@ -99,18 +125,42 @@ void VulkanSwapChain::update() {
         mColors.push_back(colorTexture);
     }
 
-    if (bundle.depth != VK_NULL_HANDLE) {
-        mDepth = fvkmemory::resource_ptr<VulkanTexture>::construct(mResourceManager, mContext,
-                device, mAllocator, mResourceManager, mCommands, bundle.depth, VK_NULL_HANDLE,
+    mDepths.reserve(bundle.depths.size());
+    for (auto const depth: bundle.depths) {
+        mDepths.push_back(fvkmemory::resource_ptr<VulkanTexture>::construct(mResourceManager,
+                mContext, device, mAllocator, mResourceManager, mCommands, depth, VK_NULL_HANDLE,
                 bundle.depthFormat, VK_NULL_HANDLE /*ycrcb */, VK_NULL_HANDLE, VK_NULL_HANDLE,
                 Platform::ExternalImageHandle(), /*levels=*/1, /*samples=*/1, bundle.extent.width,
-                bundle.extent.height, bundle.layerCount, depthUsage, mStagePool);
-    } else {
-        mDepth = {};
+                bundle.extent.height, bundle.layerCount, depthUsage, mStagePool));
     }
 
     mExtent = bundle.extent;
     mLayerCount = bundle.layerCount;
+
+    mMsaaColor = {};
+    mMsaaDepth = {};
+    if (mSamples > 1) {
+        VkPhysicalDevice const physicalDevice = mPlatform->getPhysicalDevice();
+        TextureFormat colorFormat;
+        TextureFormat depthFormat;
+        if (!toTextureFormat(bundle.colorFormat, &colorFormat)) {
+            FVK_LOGW << "Swapchain format " << (int) bundle.colorFormat
+                     << " cannot be multi-sampled; rendering without MSAA." << utils::io::endl;
+        } else {
+            mMsaaColor = fvkmemory::resource_ptr<VulkanTexture>::construct(mResourceManager, device,
+                    physicalDevice, mContext, mAllocator, mResourceManager, mCommands,
+                    SamplerType::SAMPLER_2D_ARRAY, /*levels=*/1, colorFormat, mSamples,
+                    bundle.extent.width, bundle.extent.height, bundle.layerCount, colorUsage,
+                    mStagePool);
+            if (!mDepths.empty() && toTextureFormat(bundle.depthFormat, &depthFormat)) {
+                mMsaaDepth = fvkmemory::resource_ptr<VulkanTexture>::construct(mResourceManager,
+                        device, physicalDevice, mContext, mAllocator, mResourceManager, mCommands,
+                        SamplerType::SAMPLER_2D_ARRAY, /*levels=*/1, depthFormat, mSamples,
+                        bundle.extent.width, bundle.extent.height, bundle.layerCount, depthUsage,
+                        mStagePool);
+            }
+        }
+    }
 }
 
 void VulkanSwapChain::present(DriverBase& driver) {

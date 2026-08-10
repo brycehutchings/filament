@@ -62,7 +62,11 @@ struct VulkanSwapChain : public HwSwapChain, fvkmemory::Resource {
     }
 
     inline fvkmemory::resource_ptr<VulkanTexture> getDepth() const noexcept {
-        return mDepth;
+        if (mDepths.empty()) {
+            return {};
+        }
+        // A platform may share a single depth image across all color images.
+        return mDepths[mDepths.size() == 1 ? 0 : mCurrentSwapIndex];
     }
 
     inline bool isFirstRenderPass() const noexcept {
@@ -80,6 +84,22 @@ struct VulkanSwapChain : public HwSwapChain, fvkmemory::Resource {
     inline bool isProtected() noexcept {
         return mPlatform->isProtected(swapChain);
     }
+
+    // When multi-sampled, rendering goes to these sidecars and is resolved into the swapchain
+    // images at the end of the render pass. One pair is enough for every image because the
+    // contents never need to survive the pass.
+    inline uint8_t getSamples() const noexcept { return mSamples; }
+
+    inline fvkmemory::resource_ptr<VulkanTexture> getMsaaColor() const noexcept {
+        return mMsaaColor;
+    }
+
+    inline fvkmemory::resource_ptr<VulkanTexture> getMsaaDepth() const noexcept {
+        return mMsaaDepth;
+    }
+
+    // Resolving depth is only worth it if something is going to read it back.
+    inline bool isDepthPreserved() const noexcept { return mPreserveDepth; }
 
     inline void setFrameScheduledCallback(CallbackHandler* handler,
             FrameScheduledCallback&& callback) noexcept {
@@ -117,9 +137,13 @@ private:
     // transitions, which are useful here.
     utils::FixedCapacityVector<fvkmemory::resource_ptr<VulkanTexture>> mColors;
     utils::FixedCapacityVector<fvkmemory::resource_ptr<VulkanSemaphore>> mFinishedDrawing;
-    fvkmemory::resource_ptr<VulkanTexture> mDepth;
+    utils::FixedCapacityVector<fvkmemory::resource_ptr<VulkanTexture>> mDepths;
+    fvkmemory::resource_ptr<VulkanTexture> mMsaaColor;
+    fvkmemory::resource_ptr<VulkanTexture> mMsaaDepth;
     VkExtent2D mExtent;
     uint32_t mLayerCount;
+    uint8_t const mSamples;
+    bool const mPreserveDepth;
     uint32_t mCurrentSwapIndex;
     bool mAcquired;
     bool mIsFirstRenderPass;

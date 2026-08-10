@@ -6,3 +6,8 @@
 appropriate header in [RELEASE_NOTES.md](./RELEASE_NOTES.md).
 
 ## Release notes for next branch cut
+
+- vulkan: `VulkanPlatform::SwapChainBundle::depth` is replaced by `depths`, which may hold either a
+  single shared depth image or one image per color image.
+- Added `SwapChain::CONFIG_PRESERVE_DEPTH_BUFFER`, which stops Filament from discarding the default
+  render target's depth attachment at the end of the render pass.

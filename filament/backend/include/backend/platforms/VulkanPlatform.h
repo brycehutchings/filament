@@ -114,7 +114,11 @@ public:
      */
     struct SwapChainBundle {
         utils::FixedCapacityVector<VkImage> colors;
-        VkImage depth = VK_NULL_HANDLE;
+        /**
+         * Either empty (no depth attachment), a single image shared by every color image, or one
+         * image per entry in `colors`, indexed by the same image index returned by acquire().
+         */
+        utils::FixedCapacityVector<VkImage> depths;
         VkFormat colorFormat = VK_FORMAT_UNDEFINED;
         VkFormat depthFormat = VK_FORMAT_UNDEFINED;
         VkExtent2D extent = {0, 0};

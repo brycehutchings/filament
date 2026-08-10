@@ -276,6 +276,8 @@ void VulkanRenderTarget::bindSwapChain(fvkmemory::resource_ptr<VulkanSwapChain> 
     auto& fbkey = mInfo->fbkey;
     auto& rpkey = mInfo->rpkey;
 
+    uint8_t const samples = swapchain->getSamples();
+    rpkey.samples = fbkey.samples = samples;
     rpkey.colorFormat[0] = color.getFormat();
     rpkey.viewCount = color.layerCount;
     fbkey.width = width;
@@ -283,13 +285,41 @@ void VulkanRenderTarget::bindSwapChain(fvkmemory::resource_ptr<VulkanSwapChain> 
     fbkey.color[0] = color.getImageView();
     fbkey.resolve[0] = VK_NULL_HANDLE;
 
+    if (samples > 1) {
+        VulkanAttachment msaaColor = {
+            .texture = swapchain->getMsaaColor(),
+            .layerCount = color.layerCount,
+        };
+        mInfo->msaaIndex = (uint8_t) mInfo->attachments.size();
+        mInfo->attachments.push_back(msaaColor);
+        // Draw into the sidecar and let the render pass resolve into the swapchain image.
+        fbkey.color[0] = msaaColor.getImageView();
+        fbkey.resolve[0] = color.getImageView();
+        rpkey.needsResolveMask |= 1;
+    }
+
     if (swapchain->getDepth()) {
         VulkanAttachment depth = createSwapchainAttachment(swapchain->getDepth());
         mInfo->attachments.push_back(depth);
-        mInfo->depthStencilIndex = 1;
+        mInfo->depthStencilIndex = (uint8_t) (mInfo->attachments.size() - 1);
 
         rpkey.depthStencilFormat = depth.getFormat();
         fbkey.depthStencil = depth.getImageView();
+        mInfo->msaaDepthStencilIndex = mInfo->depthStencilIndex;
+
+        if (samples > 1 && swapchain->getMsaaDepth()) {
+            VulkanAttachment msaaDepth = {
+                .texture = swapchain->getMsaaDepth(),
+                .layerCount = depth.layerCount,
+            };
+            mInfo->msaaDepthStencilIndex = (uint8_t) mInfo->attachments.size();
+            mInfo->attachments.push_back(msaaDepth);
+            fbkey.depthStencil = msaaDepth.getImageView();
+            if (swapchain->isDepthPreserved()) {
+                fbkey.depthStencilResolve = depth.getImageView();
+                rpkey.needsDepthResolve = true;
+            }
+        }
     } else {
         rpkey.depthStencilFormat = VK_FORMAT_UNDEFINED;
         fbkey.depthStencil = VK_NULL_HANDLE;
@@ -300,6 +330,13 @@ void VulkanRenderTarget::bindSwapChain(fvkmemory::resource_ptr<VulkanSwapChain> 
 void VulkanRenderTarget::releaseSwapchain() {
     mInfo->colors = {};
     mInfo->attachments.clear();
+    mInfo->depthStencilIndex = Auxiliary::UNDEFINED_INDEX;
+    mInfo->msaaDepthStencilIndex = Auxiliary::UNDEFINED_INDEX;
+    mInfo->msaaIndex = Auxiliary::UNDEFINED_INDEX;
+    mInfo->rpkey.needsResolveMask = 0;
+    mInfo->rpkey.needsDepthResolve = 0;
+    mInfo->fbkey.resolve[0] = VK_NULL_HANDLE;
+    mInfo->fbkey.depthStencilResolve = VK_NULL_HANDLE;
 }
 
 VulkanRenderTarget::VulkanRenderTarget(VkDevice device, VkPhysicalDevice physicalDevice,
@@ -412,6 +449,10 @@ VulkanRenderTarget::VulkanRenderTarget(VkDevice device, VkPhysicalDevice physica
                 };
                 attachments.push_back(msaaAttachment);
                 fbkey.depthStencil = msaaAttachment.getImageView();
+                // Keep the single-sampled image as the resolve target, otherwise everything drawn
+                // into the multi-sampled sidecar is thrown away at the end of the pass.
+                fbkey.depthStencilResolve = depthStencil.getImageView();
+                rpkey.needsDepthResolve = true;
             }
         }
     }

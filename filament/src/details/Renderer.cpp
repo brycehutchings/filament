@@ -1077,6 +1077,8 @@ void FRenderer::renderJob(DriverApi& driver, RootArenaScope& rootArenaScope, FVi
         // For custom RenderTarget, we look at each attachment flag and if they have their
         // SAMPLEABLE usage bit set, we assume they must not be discarded after the render pass.
         keepOverrideEndFlags |= customRenderTarget->getSampleableAttachmentsMask();
+    } else if (mSwapChain && mSwapChain->preservesDepthBuffer()) {
+        keepOverrideEndFlags |= TargetBufferFlags::DEPTH;
     }
 
     // Renderer's ClearOptions apply once at the beginning of the frame (not for each View),
