@@ -13,6 +13,10 @@
     <uses-permission android:name="com.oculus.permission.RENDER_MODEL" />
     <uses-feature android:name="com.oculus.feature.RENDER_MODEL" android:required="false" />
 
+    <!-- Meta gates passthrough behind this flag; without it the runtime offers no alpha blend
+         environment. Optional, because passthrough is opt-in and the sample runs fine without. -->
+    <uses-feature android:name="com.oculus.feature.PASSTHROUGH" android:required="false" />
+
     <application
         android:label="Filament OpenXR"
         android:allowBackup="false"

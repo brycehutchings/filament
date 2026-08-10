@@ -119,6 +119,7 @@ struct Config {
     bool renderModels = true;
     bool handMeshes = true;
     bool quadLayer = true;
+    bool passthrough = false;
     bool dumpQuad = false;          // dump the quad layer instead of the projection layer
     uint32_t dumpFrame = 0;         // 0 means "never dump"
     std::string dumpPrefix = "helloxr";
@@ -130,6 +131,15 @@ char const* xrResultName(XrInstance instance, XrResult result) {    static char 
     }
     snprintf(buffer, sizeof(buffer), "XrResult(%d)", static_cast<int>(result));
     return buffer;
+}
+
+char const* blendModeName(XrEnvironmentBlendMode mode) {
+    switch (mode) {
+        case XR_ENVIRONMENT_BLEND_MODE_OPAQUE: return "opaque";
+        case XR_ENVIRONMENT_BLEND_MODE_ADDITIVE: return "additive";
+        case XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND: return "alpha blend";
+        default: return "unknown";
+    }
 }
 
 mat4 toMat4(XrPosef const& pose) {
@@ -890,6 +900,35 @@ private:
         mEyeWidth = mViewConfigs[0].recommendedImageRectWidth;
         mEyeHeight = mViewConfigs[0].recommendedImageRectHeight;
         XRLOG("view configuration: %ux%u per eye", mEyeWidth, mEyeHeight);
+
+        uint32_t blendModeCount = 0;
+        if (!xrCheck(xrEnumerateEnvironmentBlendModes(mXrInstance, mSystemId, kViewConfigType, 0,
+                            &blendModeCount, nullptr),
+                    "xrEnumerateEnvironmentBlendModes")) {
+            return false;
+        }
+        std::vector<XrEnvironmentBlendMode> blendModes(blendModeCount);
+        if (!xrCheck(xrEnumerateEnvironmentBlendModes(mXrInstance, mSystemId, kViewConfigType,
+                            blendModeCount, &blendModeCount, blendModes.data()),
+                    "xrEnumerateEnvironmentBlendModes")) {
+            return false;
+        }
+        std::string blendModeList;
+        for (XrEnvironmentBlendMode const mode: blendModes) {
+            blendModeList += std::string(blendModeName(mode)) + " ";
+        }
+        XRLOG("environment blend modes: %s", blendModeList.c_str());
+
+        if (mConfig.passthrough) {
+            if (std::find(blendModes.begin(), blendModes.end(),
+                        XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND) != blendModes.end()) {
+                mBlendMode = XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
+                mPassthroughActive = true;
+                XRLOG("passthrough enabled");
+            } else {
+                XRLOG("passthrough unavailable: the runtime offers no alpha blend environment");
+            }
+        }
         return true;
     }
 
@@ -1419,7 +1458,7 @@ private:
                 .build(*mEngine, mLight);
         mScene->addEntity(mLight);
 
-        if (!loadIbl()) {
+        if (!loadIbl() && !mPassthroughActive) {
             mSkybox = Skybox::Builder().color({ 0.06f, 0.07f, 0.10f, 1.0f }).build(*mEngine);
         }
         mScene->setSkybox(mSkybox);
@@ -1434,6 +1473,22 @@ private:
         mView->setShadowingEnabled(false);
         mView->setStereoscopicOptions({ .enabled = true });
 
+        if (mPassthroughActive) {
+            // The clear is what makes the frame transparent wherever the scene does not cover it.
+            // View::BlendMode::TRANSLUCENT would be the obvious companion and must be avoided: it
+            // forces a blit whose material samples a plain 2D texture, which a multiview array
+            // target is not, and the second eye ends up showing the first eye's layer.
+            Renderer::ClearOptions const clearOptions{
+                .clearColor = { 0.0, 0.0, 0.0, 0.0 },
+                .clear = true,
+            };
+            mRenderer->setClearOptions(clearOptions);
+            if (mQuadRenderer != nullptr) {
+                // The quad draws the same scene, so it lost its background too. Without a clear it
+                // keeps whatever that swapchain image held when it last came round.
+                mQuadRenderer->setClearOptions(clearOptions);
+            }
+        }
         if (mConfig.quadLayer) {
             // The same scene from a fixed viewpoint, so the panel shows something recognisable
             // without needing assets of its own. Stereo has to be off: the quad swapchain has a
@@ -1460,20 +1515,15 @@ private:
             return false;
         }
         std::vector<uint8_t> iblData;
-        std::vector<uint8_t> skyData;
-        if (!helloxr::readAsset(mConfig.ibl + "_ibl.ktx", &iblData) ||
-                !helloxr::readAsset(mConfig.ibl + "_skybox.ktx", &skyData)) {
+        if (!helloxr::readAsset(mConfig.ibl + "_ibl.ktx", &iblData)) {
             XRLOG("no IBL at '%s'; using a flat skybox", mConfig.ibl.c_str());
             return false;
         }
 
         auto* iblBundle = new image::Ktx1Bundle(iblData.data(), uint32_t(iblData.size()));
-        auto* skyBundle = new image::Ktx1Bundle(skyData.data(), uint32_t(skyData.size()));
         math::float3 sphericalHarmonics[9];
         bool const hasHarmonics = iblBundle->getSphericalHarmonics(sphericalHarmonics);
-
         mIblTexture = ktxreader::Ktx1Reader::createTexture(mEngine, iblBundle, false);
-        mSkyboxTexture = ktxreader::Ktx1Reader::createTexture(mEngine, skyBundle, false);
 
         auto builder = IndirectLight::Builder().reflections(mIblTexture).intensity(30000.0f);
         if (hasHarmonics) {
@@ -1481,9 +1531,22 @@ private:
         }
         mIndirectLight = builder.build(*mEngine);
         mScene->setIndirectLight(mIndirectLight);
-
-        mSkybox = Skybox::Builder().environment(mSkyboxTexture).showSun(true).build(*mEngine);
         XRLOG("loaded IBL from '%s'", mConfig.ibl.c_str());
+
+        // Passthrough lights the scene from the environment without drawing it, so the skybox
+        // half of the pair is never uploaded.
+        if (mPassthroughActive) {
+            return true;
+        }
+
+        std::vector<uint8_t> skyData;
+        if (!helloxr::readAsset(mConfig.ibl + "_skybox.ktx", &skyData)) {
+            XRLOG("no skybox at '%s'; using a flat one", mConfig.ibl.c_str());
+            return false;
+        }
+        auto* skyBundle = new image::Ktx1Bundle(skyData.data(), uint32_t(skyData.size()));
+        mSkyboxTexture = ktxreader::Ktx1Reader::createTexture(mEngine, skyBundle, false);
+        mSkybox = Skybox::Builder().environment(mSkyboxTexture).showSun(true).build(*mEngine);
         return true;
     }
 
@@ -1624,7 +1687,7 @@ private:
 
         submission.endInfo = { XR_TYPE_FRAME_END_INFO };
         submission.endInfo.displayTime = frameState.predictedDisplayTime;
-        submission.endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+        submission.endInfo.environmentBlendMode = mBlendMode;
         submission.endInfo.layerCount = layerCount;
         submission.endInfo.layers = submission.layers;
 
@@ -1730,6 +1793,10 @@ private:
             }
         }
         submission.projection = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+        if (mPassthroughActive) {
+            // Without this the compositor ignores our alpha and the world never shows through.
+            submission.projection.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+        }
         submission.projection.space = mAppSpace;
         submission.projection.viewCount = kEyeCount;
         submission.projection.views = submission.projectionViews;
@@ -1785,6 +1852,11 @@ private:
     uint32_t mGraphicsQueueFamilyIndex = 0;
     bool mDebugUtilsEnabled = false;
     bool mDepthLayerSupported = false;
+
+    // Passthrough is just an environment blend mode: the runtime shows the physical world
+    // wherever the submitted frame is transparent.
+    bool mPassthroughActive = false;
+    XrEnvironmentBlendMode mBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
 
     XrVulkanPlatform mPlatform;
     Engine* mEngine = nullptr;
@@ -1847,6 +1919,8 @@ void printUsage() {
           "  --no-render-models  do not draw the runtime's controller models\n"
           "  --no-hand-meshes  do not draw tracked hand meshes\n"
           "  --no-quad-layer   do not submit the second composition layer\n"
+          "  --passthrough     composite the scene over the physical world, with the\n"
+          "                    environment map lighting the scene but never drawn\n"
           "  --dump-quad       dump the quad layer rather than the projection layer\n"
           "  --help            print this message");
 }
@@ -1887,6 +1961,8 @@ bool parseArguments(std::vector<std::string> const& args, Config* config) {
             config->handMeshes = false;
         } else if (arg == "--no-quad-layer") {
             config->quadLayer = false;
+        } else if (arg == "--passthrough") {
+            config->passthrough = true;
         } else if (arg == "--dump-quad") {
             config->dumpQuad = true;
         } else {
