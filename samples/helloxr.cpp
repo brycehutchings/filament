@@ -45,9 +45,11 @@
 #include <filament/MaterialInstance.h>
 #include <filament/RenderableManager.h>
 #include <filament/Renderer.h>
+#include <filament/RenderTarget.h>
 #include <filament/Scene.h>
 #include <filament/Skybox.h>
 #include <filament/SwapChain.h>
+#include <filament/Texture.h>
 #include <filament/TransformManager.h>
 #include <filament/View.h>
 #include <filament/Viewport.h>
@@ -114,6 +116,7 @@ struct Config {
 #endif
     double nearPlane = 0.05;
     double farPlane = 100.0;
+    uint8_t msaa = 4;               // 1 disables multi-sampling
     bool validation = true;
     bool depthLayer = true;
     bool listExtensions = false;
@@ -144,27 +147,40 @@ mat4 projectionFromFov(XrFovf const& fov, double near, double far) {
             std::tan(fov.angleDown) * near, std::tan(fov.angleUp) * near, near, far);
 }
 
+// The XR runtime hands out VkFormats; wrapping those images as Filament textures needs the
+// matching Filament format. Only what a swapchain can plausibly be created with is covered.
+bool toInternalFormat(VkFormat format, Texture::InternalFormat* out) {
+    switch (format) {
+        case VK_FORMAT_R8G8B8A8_SRGB: *out = Texture::InternalFormat::SRGB8_A8; return true;
+        case VK_FORMAT_R8G8B8A8_UNORM: *out = Texture::InternalFormat::RGBA8; return true;
+        case VK_FORMAT_D16_UNORM: *out = Texture::InternalFormat::DEPTH16; return true;
+        case VK_FORMAT_D32_SFLOAT: *out = Texture::InternalFormat::DEPTH32F; return true;
+        case VK_FORMAT_D24_UNORM_S8_UINT:
+            *out = Texture::InternalFormat::DEPTH24_STENCIL8;
+            return true;
+        case VK_FORMAT_D32_SFLOAT_S8_UINT:
+            *out = Texture::InternalFormat::DEPTH32F_STENCIL8;
+            return true;
+        default: return false;
+    }
+}
+
 } // anonymous namespace
 
 // ------------------------------------------------------------------------------------------------
 // Platform
 // ------------------------------------------------------------------------------------------------
 
-// Presents the OpenXR swapchains to Filament as if they were a regular Vulkan swapchain. Every
-// override below runs on Filament's driver thread.
+// Filament renders into a RenderTarget that wraps the OpenXR images directly, so this platform
+// only exists to satisfy VulkanPlatform and to read frames back. Filament's own swapchain is
+// headless and never presented.
 class XrVulkanPlatform final : public VulkanPlatform {
 public:
-    struct XrSwapChain : public Platform::SwapChain {
+    struct XrSwapChain {
         XrSwapchain color = XR_NULL_HANDLE;
         XrSwapchain depth = XR_NULL_HANDLE;
         SwapChainBundle bundle;
     };
-
-    void setSwapChain(XrSwapChain* swapChain) noexcept { mSwapChain = swapChain; }
-
-    // Asks for the next presented frame to be copied back to the host. Used to verify from the
-    // command line that both multiview layers and the depth buffer really were written.
-    void requestFrameDump(char const* prefix) noexcept { mDumpPrefix = prefix; }
 
     Customization getCustomization() const noexcept override {
         Customization customization;
@@ -173,75 +189,10 @@ public:
         return customization;
     }
 
-    SwapChainBundle getSwapChainBundle(SwapChainPtr handle) override {
-        return static_cast<XrSwapChain*>(handle)->bundle;
-    }
-
-    SwapChainPtr createSwapChain(void*, uint64_t, VkExtent2D) override { return mSwapChain; }
-
-    void destroy(SwapChainPtr) override {} // the XR swapchains outlive the Engine
-
-    bool hasResized(SwapChainPtr) override { return false; }
-
-    bool isProtected(SwapChainPtr) override { return false; }
-
-    VkResult recreate(SwapChainPtr) override { return VK_SUCCESS; }
-
-    VkResult acquire(SwapChainPtr handle, ImageSyncData* outImageSyncData) override {
-        auto* swapChain = static_cast<XrSwapChain*>(handle);
-        uint32_t colorIndex = 0;
-        if (!acquireAndWait(swapChain->color, &colorIndex)) {
-            return VK_ERROR_UNKNOWN;
-        }
-        if (swapChain->depth != XR_NULL_HANDLE) {
-            uint32_t depthIndex = 0;
-            if (!acquireAndWait(swapChain->depth, &depthIndex)) {
-                return VK_ERROR_UNKNOWN;
-            }
-            // Filament indexes color and depth with one image index, so the chains must stay in
-            // lockstep. They do as long as we always acquire and release them together.
-            if (depthIndex != colorIndex) {
-                XRLOG("color/depth swapchain indices diverged (%u vs %u)", colorIndex, depthIndex);
-                return VK_ERROR_UNKNOWN;
-            }
-        }
-        outImageSyncData->imageIndex = colorIndex;
-        outImageSyncData->imageReadySemaphore = VK_NULL_HANDLE;
-        return VK_SUCCESS;
-    }
-
-    VkResult present(SwapChainPtr handle, uint32_t index, VkSemaphore finishedDrawing) override {
-        auto* swapChain = static_cast<XrSwapChain*>(handle);
-
-        // OpenXR has no way to consume Filament's completion semaphore, and Filament recycles it
-        // once this image index comes around again. Drain it with an empty submit so it is never
-        // reused while still signaled.
-        if (finishedDrawing != VK_NULL_HANDLE) {
-            VkPipelineStageFlags const waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-            VkSubmitInfo const submitInfo = {
-                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                .waitSemaphoreCount = 1,
-                .pWaitSemaphores = &finishedDrawing,
-                .pWaitDstStageMask = &waitStage,
-            };
-            vkQueueSubmit(getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
-        }
-
-        if (mDumpPrefix != nullptr) {
-            dumpFrame(*swapChain, index);
-            mDumpPrefix = nullptr;
-        }
-
-        XrSwapchainImageReleaseInfo const releaseInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
-        if (XR_FAILED(xrReleaseSwapchainImage(swapChain->color, &releaseInfo))) {
-            return VK_ERROR_UNKNOWN;
-        }
-        if (swapChain->depth != XR_NULL_HANDLE &&
-                XR_FAILED(xrReleaseSwapchainImage(swapChain->depth, &releaseInfo))) {
-            return VK_ERROR_UNKNOWN;
-        }
-        return VK_SUCCESS;
-    }
+    // Copies the images the runtime is about to composite back to the host, so the command line
+    // can verify that both multiview layers and the depth buffer really were written. Must run
+    // after the frame has been flushed and before the images are released.
+    void dumpFrame(XrSwapChain const& swapChain, uint32_t index, char const* prefix) const;
 
 protected:
     ExtensionSet getSwapchainInstanceExtensions() const override { return {}; }
@@ -251,16 +202,6 @@ protected:
     }
 
 private:
-    static bool acquireAndWait(XrSwapchain swapChain, uint32_t* outIndex) {
-        XrSwapchainImageAcquireInfo const acquireInfo = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
-        if (XR_FAILED(xrAcquireSwapchainImage(swapChain, &acquireInfo, outIndex))) {
-            return false;
-        }
-        XrSwapchainImageWaitInfo waitInfo = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
-        waitInfo.timeout = XR_INFINITE_DURATION;
-        return XR_SUCCEEDED(xrWaitSwapchainImage(swapChain, &waitInfo));
-    }
-
     uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags properties) const {
         VkPhysicalDeviceMemoryProperties memoryProperties = {};
         vkGetPhysicalDeviceMemoryProperties(getPhysicalDevice(), &memoryProperties);
@@ -374,7 +315,7 @@ private:
         return pixels;
     }
 
-    void dumpFrame(XrSwapChain const& swapChain, uint32_t index) const {
+    void dumpFrameImpl(XrSwapChain const& swapChain, uint32_t index, char const* prefix) const {
         auto const& bundle = swapChain.bundle;
         VkExtent2D const extent = bundle.extent;
         uint32_t const layers = bundle.layerCount;
@@ -439,7 +380,7 @@ private:
                     layer, luma / double(pixelsPerLayer),
                     100.0 * geometry / double(pixelsPerLayer),
                     geometry ? centroidX / double(geometry) : 0.0);
-            writePpm(std::string(mDumpPrefix) + "_eye" + std::to_string(layer) + ".ppm", data,
+            writePpm(std::string(prefix) + "_eye" + std::to_string(layer) + ".ppm", data,
                     extent);
         }
         if (layers > 1) {
@@ -548,10 +489,12 @@ private:
         fclose(file);
         XRLOG("frame dump: wrote %s", path.c_str());
     }
-
-    XrSwapChain* mSwapChain = nullptr;
-    char const* mDumpPrefix = nullptr;
 };
+
+void XrVulkanPlatform::dumpFrame(XrSwapChain const& swapChain, uint32_t index,
+        char const* prefix) const {
+    dumpFrameImpl(swapChain, index, prefix);
+}
 
 // ------------------------------------------------------------------------------------------------
 // App
@@ -574,6 +517,15 @@ public:
         mFeatures.clear();
         if (mEngine) {
             mEngine->flushAndWait();
+            for (auto* renderTarget: mRenderTargets) {
+                mEngine->destroy(renderTarget);
+            }
+            for (auto* texture: mColorTextures) {
+                mEngine->destroy(texture);
+            }
+            for (auto* texture: mDepthTextures) {
+                mEngine->destroy(texture);
+            }
             mEngine->destroy(mSkybox);
             mEngine->destroy(mIndirectLight);
             mEngine->destroy(mIblTexture);
@@ -658,7 +610,7 @@ public:
                     XRLOG("note: the color/depth agreement below assumes a flat skybox; re-run "
                           "with --ibl= for a meaningful comparison");
                 }
-                mPlatform.requestFrameDump(mConfig.dumpPrefix.c_str());
+                mDumpRequested = true;
             }
 
             double const sinceReport = std::chrono::duration<double>(now - lastReport).count();
@@ -1002,6 +954,22 @@ private:
             deviceExtensions.push_back(VK_KHR_MULTIVIEW_EXTENSION_NAME);
         }
 
+        // Filament resolves the multi-sampled depth buffer into the XR depth image through a
+        // render pass resolve, which only the renderpass2 structures can describe. We create the
+        // device, and Filament skips extension discovery when given a shared context, so these
+        // have to be requested here.
+        if (mConfig.msaa > 1) {
+            for (char const* name: { VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME,
+                         VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME }) {
+                if (!supportsExtension(name)) {
+                    XRLOG("the GPU does not support %s, which %ux MSAA requires", name,
+                            uint32_t(mConfig.msaa));
+                    return false;
+                }
+                deviceExtensions.push_back(name);
+            }
+        }
+
         // One queue, shared with Filament: the runtime synchronizes against the queue named in the
         // graphics binding, so every submission has to land on that same queue.
         float const queuePriority = 1.0f;
@@ -1152,7 +1120,9 @@ private:
                   VK_FORMAT_D16_UNORM });
 
         XrSwapchainCreateInfo createInfo = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
-        createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+        // Filament will only wrap an imported image if it is sampleable.
+        createInfo.usageFlags =
+                XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
         if (mConfig.dumpFrame != 0) {
             createInfo.usageFlags |= XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT;
         }
@@ -1175,7 +1145,8 @@ private:
 
         std::vector<VkImage> depthImages;
         if (depthFormat != 0) {
-            createInfo.usageFlags = XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+            createInfo.usageFlags = XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                    XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
             if (mConfig.dumpFrame != 0) {
                 createInfo.usageFlags |= XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT;
             }
@@ -1216,7 +1187,6 @@ private:
                 bundle.layerCount);
         mDepthLayerSupported = mDepthLayerSupported && mXrSwapChain.depth != XR_NULL_HANDLE;
         XRLOG("depth submission: %s", mDepthLayerSupported ? "enabled" : "disabled");
-        mPlatform.setSwapChain(&mXrSwapChain);
         return true;
     }
 
@@ -1270,19 +1240,67 @@ private:
         }
         XRLOG("Filament engine created with multiview stereo");
 
-        // Without this Filament discards the depth attachment at the end of the render pass and
-        // the runtime would be handed undefined depth.
-        uint64_t swapChainFlags = 0;
-        if (mXrSwapChain.depth != XR_NULL_HANDLE) {
-            swapChainFlags |= filament::SwapChain::CONFIG_PRESERVE_DEPTH_BUFFER;
-        }
-        if (mXrSwapChain.bundle.depthFormat == VK_FORMAT_D32_SFLOAT_S8_UINT ||
-                mXrSwapChain.bundle.depthFormat == VK_FORMAT_D24_UNORM_S8_UINT) {
-            swapChainFlags |= filament::SwapChain::CONFIG_HAS_STENCIL_BUFFER;
-        }
-        mFilamentSwapChain = mEngine->createSwapChain(kNativeWindowSentinel, swapChainFlags);
+        // Nothing is ever drawn into Filament's own swapchain: it only exists because a frame has
+        // to begin against one. The OpenXR images are wrapped as render targets instead, which is
+        // what lets them be multi-sampled and resolved without an extra pass.
+        mFilamentSwapChain = mEngine->createSwapChain(1, 1, 0);
         mRenderer = mEngine->createRenderer();
-        return mFilamentSwapChain != nullptr && mRenderer != nullptr;
+        return mFilamentSwapChain != nullptr && mRenderer != nullptr && createRenderTargets();
+    }
+
+    bool createRenderTargets() {
+        auto const& bundle = mXrSwapChain.bundle;
+        Texture::InternalFormat colorFormat;
+        if (!toInternalFormat(bundle.colorFormat, &colorFormat)) {
+            XRLOG("cannot wrap color format %d as a texture", int(bundle.colorFormat));
+            return false;
+        }
+        Texture::InternalFormat depthFormat = {};
+        bool const hasDepth =
+                !bundle.depths.empty() && toInternalFormat(bundle.depthFormat, &depthFormat);
+
+        for (size_t i = 0; i < bundle.colors.size(); ++i) {
+            Texture* const color = Texture::Builder()
+                                           .import(intptr_t(bundle.colors[i]))
+                                           .width(mEyeWidth)
+                                           .height(mEyeHeight)
+                                           .depth(kEyeCount)
+                                           .levels(1)
+                                           .sampler(Texture::Sampler::SAMPLER_2D_ARRAY)
+                                           .format(colorFormat)
+                                           .usage(Texture::Usage::COLOR_ATTACHMENT |
+                                                   Texture::Usage::SAMPLEABLE)
+                                           .build(*mEngine);
+            mColorTextures.push_back(color);
+
+            auto builder = RenderTarget::Builder()
+                                   .texture(RenderTarget::AttachmentPoint::COLOR0, color)
+                                   .multiview(RenderTarget::AttachmentPoint::COLOR0, kEyeCount)
+                                   .samples(mConfig.msaa);
+            if (hasDepth) {
+                // SAMPLEABLE is what tells Filament the contents have to survive the pass, which
+                // is the whole point of handing depth to the compositor.
+                Texture* const depth =
+                        Texture::Builder()
+                                .import(intptr_t(bundle.depths[i]))
+                                .width(mEyeWidth)
+                                .height(mEyeHeight)
+                                .depth(kEyeCount)
+                                .levels(1)
+                                .sampler(Texture::Sampler::SAMPLER_2D_ARRAY)
+                                .format(depthFormat)
+                                .usage(Texture::Usage::DEPTH_ATTACHMENT |
+                                        Texture::Usage::SAMPLEABLE)
+                                .build(*mEngine);
+                mDepthTextures.push_back(depth);
+                builder.texture(RenderTarget::AttachmentPoint::DEPTH, depth)
+                        .multiview(RenderTarget::AttachmentPoint::DEPTH, kEyeCount);
+            }
+            mRenderTargets.push_back(builder.build(*mEngine));
+        }
+        XRLOG("wrapped %zu OpenXR images as %ux multi-sampled render targets",
+                mRenderTargets.size(), uint32_t(mConfig.msaa));
+        return true;
     }
 
     bool createScene() {
@@ -1556,14 +1574,28 @@ private:
             }
         }
 
+        // The images have to be acquired before the render target can be chosen, so unlike the
+        // swapchain-backed path this happens on this thread rather than the driver thread.
+        uint32_t imageIndex = 0;
+        if (!acquireImages(&imageIndex)) {
+            return false;
+        }
+        mView->setRenderTarget(mRenderTargets[imageIndex]);
+
         if (!mRenderer->beginFrame(mFilamentSwapChain)) {
+            releaseImages();
             return false;
         }
         mRenderer->render(mView);
         mRenderer->endFrame();
-        // The driver thread is what calls xrAcquire/Wait/ReleaseSwapchainImage, so it has to finish
-        // before xrEndFrame.
+        // The driver thread has to be done before the images go back to the runtime.
         mEngine->flushAndWait();
+
+        if (mDumpRequested) {
+            mPlatform.dumpFrame(mXrSwapChain, imageIndex, mConfig.dumpPrefix.c_str());
+            mDumpRequested = false;
+        }
+        releaseImages();
 
         for (uint32_t i = 0; i < kEyeCount; ++i) {
             projectionViews[i] = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
@@ -1595,8 +1627,46 @@ private:
         return true;
     }
 
-    void animate(XrTime displayTime) {
-        float const seconds = float(double(displayTime) * 1e-9);
+    // Color and depth are always acquired and released together, which is what keeps their image
+    // indices in step with each other.
+    bool acquireImages(uint32_t* outIndex) {
+        auto const acquireAndWait = [](XrSwapchain swapChain, uint32_t* outIndex) {
+            XrSwapchainImageAcquireInfo const acquireInfo = {
+                XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO
+            };
+            if (XR_FAILED(xrAcquireSwapchainImage(swapChain, &acquireInfo, outIndex))) {
+                return false;
+            }
+            XrSwapchainImageWaitInfo waitInfo = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+            waitInfo.timeout = XR_INFINITE_DURATION;
+            return bool(XR_SUCCEEDED(xrWaitSwapchainImage(swapChain, &waitInfo)));
+        };
+
+        if (!acquireAndWait(mXrSwapChain.color, outIndex)) {
+            return false;
+        }
+        if (mXrSwapChain.depth != XR_NULL_HANDLE) {
+            uint32_t depthIndex = 0;
+            if (!acquireAndWait(mXrSwapChain.depth, &depthIndex)) {
+                return false;
+            }
+            if (depthIndex != *outIndex) {
+                XRLOG("color/depth swapchain indices diverged (%u vs %u)", *outIndex, depthIndex);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void releaseImages() {
+        XrSwapchainImageReleaseInfo const releaseInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+        xrReleaseSwapchainImage(mXrSwapChain.color, &releaseInfo);
+        if (mXrSwapChain.depth != XR_NULL_HANDLE) {
+            xrReleaseSwapchainImage(mXrSwapChain.depth, &releaseInfo);
+        }
+    }
+
+    void animate(XrTime displayTime) {        float const seconds = float(double(displayTime) * 1e-9);
         auto& tcm = mEngine->getTransformManager();
         mat4f const transform = mat4f::translation(float3{ 0.0f, 0.0f, -2.0f }) *
                                 mat4f::rotation(seconds, float3{ 0.0f, 1.0f, 0.0f });
@@ -1625,6 +1695,10 @@ private:
     Engine* mEngine = nullptr;
     Renderer* mRenderer = nullptr;
     filament::SwapChain* mFilamentSwapChain = nullptr;
+    std::vector<Texture*> mColorTextures;
+    std::vector<Texture*> mDepthTextures;
+    std::vector<RenderTarget*> mRenderTargets;
+    bool mDumpRequested = false;
     Scene* mScene = nullptr;
     View* mView = nullptr;
     Camera* mCamera = nullptr;
@@ -1664,6 +1738,7 @@ void printUsage() {
           "  --timeout=S       stop after S seconds, 0 to disable\n"
           "  --near=D          near plane distance in meters (default: 0.05)\n"
           "  --far=D           far plane distance in meters (default: 100)\n"
+          "  --msaa=N          multi-sample count, 1 to disable (default: 4)\n"
           "  --dump-frame=N    read frame N back and report per-eye color and depth stats\n"
           "                    (the color/depth cross-check assumes --ibl= i.e. a flat skybox)\n"
           "  --dump-prefix=P   file name prefix for --dump-frame\n"
@@ -1690,6 +1765,8 @@ bool parseArguments(std::vector<std::string> const& args, Config* config) {
             config->nearPlane = std::strtod(arg.c_str() + 7, nullptr);
         } else if (startsWith("--far=")) {
             config->farPlane = std::strtod(arg.c_str() + 6, nullptr);
+        } else if (startsWith("--msaa=")) {
+            config->msaa = uint8_t(std::strtoul(arg.c_str() + 7, nullptr, 10));
         } else if (startsWith("--dump-frame=")) {
             config->dumpFrame = uint32_t(std::strtoul(arg.c_str() + 13, nullptr, 10));
         } else if (startsWith("--dump-prefix=")) {
