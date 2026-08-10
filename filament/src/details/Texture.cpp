@@ -291,6 +291,7 @@ Texture* Texture::Builder::build(Engine& engine) {
     }
 
     const bool sampleable = bool(mImpl->mUsage & TextureUsage::SAMPLEABLE);
+    const bool attachment = bool(mImpl->mUsage & TextureUsage::ALL_ATTACHMENTS);
     const bool swizzled = mImpl->mTextureIsSwizzled;
     const bool imported = mImpl->mImportedId;
     const bool external = mImpl->mExternal;
@@ -303,8 +304,10 @@ Texture* Texture::Builder::build(Engine& engine) {
     FILAMENT_CHECK_PRECONDITION((swizzled && sampleable) || !swizzled)
             << "Swizzled texture must be SAMPLEABLE";
 
-    FILAMENT_CHECK_PRECONDITION((imported && sampleable) || !imported)
-            << "Imported texture must be SAMPLEABLE";
+    // An imported image is often one somebody else owns and that we only ever render into, such as
+    // an image belonging to an XR runtime, so being sampleable is not a reasonable thing to demand.
+    FILAMENT_CHECK_PRECONDITION(!imported || sampleable || attachment)
+            << "Imported texture must be SAMPLEABLE or an attachment";
 
     FILAMENT_CHECK_PRECONDITION(!(external && asynchronous))
             << "Asynchronous operation is not supported for external texture";
