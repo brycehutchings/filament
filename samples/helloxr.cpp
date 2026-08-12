@@ -807,6 +807,7 @@ private:
         }
 
         mFoveation.requestExtensions(mConfig.foveation, supports, &extensions);
+        mControllerInput.requestExtensions(supports, &extensions);
         mJetpackUi.requestExtensions(mConfig.jetpackUi, supports, &extensions);
 
         // A feature is only kept if the runtime has everything it asked for.

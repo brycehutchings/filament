@@ -14,6 +14,15 @@ constexpr char const* HAND_PATHS[ControllerInput::HAND_COUNT] = {
 
 } // anonymous namespace
 
+void ControllerInput::requestExtensions(std::function<bool(char const*)> const& supports,
+        std::vector<char const*>* extensions) {
+    mHandInteractionSupported = supports(XR_EXT_HAND_INTERACTION_EXTENSION_NAME);
+    if (mHandInteractionSupported) {
+        extensions->push_back(XR_EXT_HAND_INTERACTION_EXTENSION_NAME);
+        XRLOG("controller input: hand interaction enabled");
+    }
+}
+
 bool ControllerInput::initialize(XrInstance instance, XrSession session) {
     mInstance = instance;
     mSession = session;
@@ -73,6 +82,35 @@ bool ControllerInput::initialize(XrInstance instance, XrSession session) {
     if (XR_FAILED(xrSuggestInteractionProfileBindings(instance, &suggested))) {
         XRLOG("controller input: xrSuggestInteractionProfileBindings failed");
         return false;
+    }
+
+    if (mHandInteractionSupported) {
+        xrStringToPath(instance, "/interaction_profiles/ext/hand_interaction_ext",
+                &mHandInteractionProfile);
+        XrActionSuggestedBinding handBindings[HAND_COUNT * 3] = {};
+        for (uint32_t hand = 0; hand < HAND_COUNT; ++hand) {
+            XrPath grip = XR_NULL_PATH;
+            XrPath aim = XR_NULL_PATH;
+            XrPath activate = XR_NULL_PATH;
+            std::string const prefix = HAND_PATHS[hand];
+            xrStringToPath(instance, (prefix + "/input/grip/pose").c_str(), &grip);
+            xrStringToPath(instance, (prefix + "/input/aim/pose").c_str(), &aim);
+            xrStringToPath(instance, (prefix + "/input/aim_activate_ext/value").c_str(),
+                    &activate);
+            handBindings[hand * 3 + 0] = { mGripAction, grip };
+            handBindings[hand * 3 + 1] = { mAimAction, aim };
+            handBindings[hand * 3 + 2] = { mTriggerAction, activate };
+        }
+        XrInteractionProfileSuggestedBinding handSuggested = {
+            XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING
+        };
+        handSuggested.interactionProfile = mHandInteractionProfile;
+        handSuggested.countSuggestedBindings = HAND_COUNT * 3;
+        handSuggested.suggestedBindings = handBindings;
+        if (XR_FAILED(xrSuggestInteractionProfileBindings(instance, &handSuggested))) {
+            XRLOG("controller input: hand interaction binding suggestion failed");
+            return false;
+        }
     }
 
     XrSessionActionSetsAttachInfo attachInfo = { XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
@@ -139,6 +177,20 @@ void ControllerInput::update(XrTime displayTime, XrSpace appSpace) {
                                      trigger.isActive
                                    ? trigger.currentState
                                    : 0.0f;
+
+        XrInteractionProfileState profile = { XR_TYPE_INTERACTION_PROFILE_STATE };
+        if (XR_SUCCEEDED(xrGetCurrentInteractionProfile(mSession, state.path, &profile)) &&
+                profile.interactionProfile != state.interactionProfile) {
+            state.interactionProfile = profile.interactionProfile;
+            if (profile.interactionProfile != XR_NULL_PATH) {
+                char path[XR_MAX_PATH_LENGTH] = {};
+                uint32_t length = 0;
+                if (XR_SUCCEEDED(xrPathToString(mInstance, profile.interactionProfile,
+                            sizeof(path), &length, path))) {
+                    XRLOG("controller input: %s uses %s", HAND_PATHS[hand], path);
+                }
+            }
+        }
     }
 }
 
@@ -182,6 +234,11 @@ bool ControllerInput::getAimPose(uint32_t hand, XrPosef* pose) const noexcept {
 
 float ControllerInput::getTriggerValue(uint32_t hand) const noexcept {
     return hand < HAND_COUNT ? mHands[hand].triggerValue : 0.0f;
+}
+
+bool ControllerInput::isHandInteraction(uint32_t hand) const noexcept {
+    return hand < HAND_COUNT && mHands[hand].interactionProfile != XR_NULL_PATH &&
+           mHands[hand].interactionProfile == mHandInteractionProfile;
 }
 
 } // namespace helloxr

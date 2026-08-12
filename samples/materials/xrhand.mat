@@ -1,5 +1,5 @@
-// Approximates the look the Meta shell uses for tracked hands: a mostly transparent fill that
-// brightens toward the silhouette, with a bright rim picking out the edge.
+// Supports both a solid hand fill and the Fresnel-only aura used by vertex streaming, with a
+// bright rim picking out the edge.
 //
 // Both terms come from the same fresnel factor, which is why the fill and the outline stay
 // consistent as the hand rotates: facing surfaces almost vanish while grazing ones light up.
@@ -18,6 +18,7 @@ material {
         { type : float3, name : fillColor },
         { type : float3, name : edgeColor },
         { type : float,  name : fillOpacity },
+        { type : float,  name : fresnelFill },
         { type : float,  name : edgeOpacity },
         { type : float,  name : edgePower },
         { type : float,  name : edgeWidth }
@@ -40,7 +41,9 @@ fragment {
         float edge = smoothstep(1.0 - materialParams.edgeWidth, 1.0, fresnel);
 
         vec3 color = mix(materialParams.fillColor, materialParams.edgeColor, edge);
-        float alpha = mix(materialParams.fillOpacity * fresnel, materialParams.edgeOpacity, edge);
+        float fillAlpha = mix(materialParams.fillOpacity,
+            materialParams.fillOpacity * fresnel, materialParams.fresnelFill);
+        float alpha = mix(fillAlpha, materialParams.edgeOpacity, edge);
 
         material.baseColor = vec4(color * alpha, alpha);
     }

@@ -128,6 +128,7 @@ public:
 
         mAuraMaterialInstance = mAuraMaterial->createInstance();
         mAuraMaterialInstance->setParameter("fillOpacity", 0.08f);
+        mAuraMaterialInstance->setParameter("fresnelFill", 1.0f);
         mAuraMaterialInstance->setParameter("edgeOpacity", 0.85f);
         mAuraMaterialInstance->setParameter("edgePower", 2.2f);
         mAuraMaterialInstance->setParameter("edgeWidth", 0.45f);

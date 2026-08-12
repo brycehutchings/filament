@@ -3,6 +3,9 @@
 
 #include "helloxr_features.h"
 
+#include <functional>
+#include <vector>
+
 #include <stdint.h>
 
 namespace helloxr {
@@ -11,6 +14,8 @@ class ControllerInput {
 public:
     static constexpr uint32_t HAND_COUNT = 2;
 
+        void requestExtensions(std::function<bool(char const*)> const& supports,
+            std::vector<char const*>* extensions);
     bool initialize(XrInstance instance, XrSession session);
     void update(XrTime displayTime, XrSpace appSpace);
     void terminate() noexcept;
@@ -18,10 +23,12 @@ public:
     bool getGripPose(uint32_t hand, XrPosef* pose) const noexcept;
     bool getAimPose(uint32_t hand, XrPosef* pose) const noexcept;
     float getTriggerValue(uint32_t hand) const noexcept;
+    bool isHandInteraction(uint32_t hand) const noexcept;
 
 private:
     struct HandState {
         XrPath path = XR_NULL_PATH;
+        XrPath interactionProfile = XR_NULL_PATH;
         XrSpace gripSpace = XR_NULL_HANDLE;
         XrSpace aimSpace = XR_NULL_HANDLE;
         XrPosef gripPose = {};
@@ -37,6 +44,8 @@ private:
     XrAction mGripAction = XR_NULL_HANDLE;
     XrAction mAimAction = XR_NULL_HANDLE;
     XrAction mTriggerAction = XR_NULL_HANDLE;
+    XrPath mHandInteractionProfile = XR_NULL_PATH;
+    bool mHandInteractionSupported = false;
     HandState mHands[HAND_COUNT];
 };
 

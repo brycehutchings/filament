@@ -19,6 +19,12 @@
 
 #include "helloxr_features.h"
 
+#if !defined(__ANDROID__)
+#include "generated/resources/resources.h"
+#endif
+
+#include <geometry/SurfaceOrientation.h>
+
 #include <filament/Engine.h>
 #include <filament/IndexBuffer.h>
 #include <filament/Material.h>
@@ -28,15 +34,11 @@
 #include <filament/TransformManager.h>
 #include <filament/VertexBuffer.h>
 
-#include <geometry/SurfaceOrientation.h>
-
 #include <utils/Entity.h>
 #include <utils/EntityManager.h>
 
-#if !defined(__ANDROID__)
-#include "generated/resources/resources.h"
-#endif
-
+#include <algorithm>
+#include <cstring>
 #include <vector>
 
 using namespace filament;
@@ -47,6 +49,7 @@ namespace {
 
 constexpr uint32_t kHandCount = 2;
 constexpr char const* kHandNames[kHandCount] = { "left", "right" };
+constexpr float kOutlineThickness = 0.003f;
 
 class HandMeshes final : public Feature {
 public:
@@ -120,9 +123,11 @@ public:
 
             if (located != state.visible) {
                 if (located) {
+                    mContext.scene->addEntity(state.outlineRenderable);
                     mContext.scene->addEntity(state.renderable);
                 } else {
                     mContext.scene->remove(state.renderable);
+                    mContext.scene->remove(state.outlineRenderable);
                 }
                 state.visible = located;
                 XRLOG("hand meshes: %s hand %s", kHandNames[hand],
@@ -145,6 +150,8 @@ public:
                 bones[joint] = mat4f(poseToMat4(joints[joint].pose)) * state.inverseBind[joint];
             }
             rcm.setBones(rcm.getInstance(state.renderable), bones.data(), state.jointCount, 0);
+            rcm.setBones(rcm.getInstance(state.outlineRenderable), bones.data(), state.jointCount,
+                    0);
         }
     }
 
@@ -157,17 +164,35 @@ public:
                 em.destroy(state.renderable);
                 state.renderable = {};
             }
+            if (!state.outlineRenderable.isNull()) {
+                mContext.scene->remove(state.outlineRenderable);
+                mContext.engine->destroy(state.outlineRenderable);
+                em.destroy(state.outlineRenderable);
+                state.outlineRenderable = {};
+            }
             if (state.vertexBuffer != nullptr) {
                 mContext.engine->destroy(state.vertexBuffer);
                 state.vertexBuffer = nullptr;
+            }
+            if (state.outlineVertexBuffer != nullptr) {
+                mContext.engine->destroy(state.outlineVertexBuffer);
+                state.outlineVertexBuffer = nullptr;
             }
             if (state.indexBuffer != nullptr) {
                 mContext.engine->destroy(state.indexBuffer);
                 state.indexBuffer = nullptr;
             }
+            if (state.outlineIndexBuffer != nullptr) {
+                mContext.engine->destroy(state.outlineIndexBuffer);
+                state.outlineIndexBuffer = nullptr;
+            }
             if (state.materialInstance != nullptr) {
                 mContext.engine->destroy(state.materialInstance);
                 state.materialInstance = nullptr;
+            }
+            if (state.outlineMaterialInstance != nullptr) {
+                mContext.engine->destroy(state.outlineMaterialInstance);
+                state.outlineMaterialInstance = nullptr;
             }
             if (state.tracker != XR_NULL_HANDLE) {
                 mDestroyHandTracker(state.tracker);
@@ -184,9 +209,13 @@ private:
     struct Hand {
         XrHandTrackerEXT tracker = XR_NULL_HANDLE;
         utils::Entity renderable;
+        utils::Entity outlineRenderable;
         VertexBuffer* vertexBuffer = nullptr;
+        VertexBuffer* outlineVertexBuffer = nullptr;
         IndexBuffer* indexBuffer = nullptr;
+        IndexBuffer* outlineIndexBuffer = nullptr;
         MaterialInstance* materialInstance = nullptr;
+        MaterialInstance* outlineMaterialInstance = nullptr;
         std::vector<mat4f> inverseBind;
         uint32_t jointCount = 0;
         bool visible = false;
@@ -324,6 +353,35 @@ private:
         state.vertexBuffer->setBufferAt(engine, 3,
                 { copy(blendWeights.data(), blendWeightsSize), blendWeightsSize, free });
 
+        std::vector<XrVector3f> outlinePositions(vertexCount);
+        for (uint32_t vertex = 0; vertex < vertexCount; ++vertex) {
+            outlinePositions[vertex] = {
+                positions[vertex].x + normals[vertex].x * kOutlineThickness,
+                positions[vertex].y + normals[vertex].y * kOutlineThickness,
+                positions[vertex].z + normals[vertex].z * kOutlineThickness,
+            };
+        }
+        state.outlineVertexBuffer = VertexBuffer::Builder()
+                                            .vertexCount(vertexCount)
+                                            .bufferCount(4)
+                                            .attribute(VertexAttribute::POSITION, 0,
+                                                    VertexBuffer::AttributeType::FLOAT3)
+                                            .attribute(VertexAttribute::TANGENTS, 1,
+                                                    VertexBuffer::AttributeType::FLOAT4)
+                                            .attribute(VertexAttribute::BONE_INDICES, 2,
+                                                    VertexBuffer::AttributeType::USHORT4)
+                                            .attribute(VertexAttribute::BONE_WEIGHTS, 3,
+                                                    VertexBuffer::AttributeType::FLOAT4)
+                                            .build(engine);
+        state.outlineVertexBuffer->setBufferAt(engine, 0,
+                { copy(outlinePositions.data(), positionsSize), positionsSize, free });
+        state.outlineVertexBuffer->setBufferAt(engine, 1,
+                { copy(tangents.data(), tangentsSize), tangentsSize, free });
+        state.outlineVertexBuffer->setBufferAt(engine, 2,
+                { copy(blendIndices.data(), blendIndicesSize), blendIndicesSize, free });
+        state.outlineVertexBuffer->setBufferAt(engine, 3,
+                { copy(blendWeights.data(), blendWeightsSize), blendWeightsSize, free });
+
         size_t const indicesSize = indexCount * sizeof(int16_t);
         state.indexBuffer = IndexBuffer::Builder()
                                     .indexCount(indexCount)
@@ -332,15 +390,57 @@ private:
         state.indexBuffer->setBuffer(engine, { copy(indices.data(), indicesSize), indicesSize,
                 free });
 
+        std::vector<int16_t> outlineIndices(indices);
+        for (uint32_t index = 0; index + 2 < indexCount; index += 3) {
+            std::swap(outlineIndices[index + 1], outlineIndices[index + 2]);
+        }
+        state.outlineIndexBuffer = IndexBuffer::Builder()
+                                           .indexCount(indexCount)
+                                           .bufferType(IndexBuffer::IndexType::USHORT)
+                                           .build(engine);
+        state.outlineIndexBuffer->setBuffer(engine,
+                { copy(outlineIndices.data(), indicesSize), indicesSize, free });
+
         state.materialInstance = mMaterial->createInstance();
+        state.materialInstance->setDoubleSided(false);
+        state.materialInstance->setCullingMode(MaterialInstance::CullingMode::BACK);
+        state.materialInstance->setDepthWrite(true);
         state.materialInstance->setParameter("fillColor", RgbType::LINEAR,
-                float3{ 0.35f, 0.55f, 0.85f });
+            float3{ 0.08f, 0.09f, 0.10f });
         state.materialInstance->setParameter("edgeColor", RgbType::LINEAR,
-                float3{ 0.75f, 0.90f, 1.0f });
-        state.materialInstance->setParameter("fillOpacity", 0.25f);
-        state.materialInstance->setParameter("edgeOpacity", 0.9f);
+            float3{ 0.16f, 0.18f, 0.20f });
+        state.materialInstance->setParameter("fillOpacity", 0.58f);
+        state.materialInstance->setParameter("fresnelFill", 0.0f);
+        state.materialInstance->setParameter("edgeOpacity", 0.72f);
         state.materialInstance->setParameter("edgePower", 2.5f);
         state.materialInstance->setParameter("edgeWidth", 0.35f);
+
+        state.outlineMaterialInstance = mMaterial->createInstance();
+        state.outlineMaterialInstance->setDoubleSided(false);
+        state.outlineMaterialInstance->setCullingMode(MaterialInstance::CullingMode::BACK);
+        state.outlineMaterialInstance->setDepthWrite(true);
+        state.outlineMaterialInstance->setParameter("fillColor", RgbType::LINEAR,
+            float3{ 0.88f, 0.91f, 0.96f });
+        state.outlineMaterialInstance->setParameter("edgeColor", RgbType::LINEAR,
+            float3{ 0.88f, 0.91f, 0.96f });
+        state.outlineMaterialInstance->setParameter("fillOpacity", 0.9f);
+        state.outlineMaterialInstance->setParameter("fresnelFill", 0.0f);
+        state.outlineMaterialInstance->setParameter("edgeOpacity", 0.9f);
+        state.outlineMaterialInstance->setParameter("edgePower", 0.0f);
+        state.outlineMaterialInstance->setParameter("edgeWidth", 1.0f);
+
+        state.outlineRenderable = utils::EntityManager::get().create();
+        RenderableManager::Builder(1)
+            .boundingBox({ { -1.0f, -1.0f, -1.0f }, { 1.0f, 1.0f, 1.0f } })
+            .material(0, state.outlineMaterialInstance)
+            .geometry(0, RenderableManager::PrimitiveType::TRIANGLES,
+                state.outlineVertexBuffer, state.outlineIndexBuffer, 0, indexCount)
+            .priority(5)
+            .culling(false)
+            .castShadows(false)
+            .receiveShadows(false)
+            .skinning(jointCount)
+            .build(engine, state.outlineRenderable);
 
         state.renderable = utils::EntityManager::get().create();
         RenderableManager::Builder(1)
@@ -354,8 +454,9 @@ private:
                 .skinning(jointCount)
                 .build(engine, state.renderable);
 
-        XRLOG("hand meshes: %s hand has %u vertices, %u indices, %u joints", kHandNames[hand],
-                vertexCount, indexCount, jointCount);
+        XRLOG("hand meshes: %s hand has %u vertices, %u indices, %u joints, %.1f mm outline",
+            kHandNames[hand], vertexCount, indexCount, jointCount,
+            kOutlineThickness * 1000.0f);
         return true;
     }
 

@@ -98,7 +98,8 @@ public:
         for (uint32_t hand = 0; hand < kHandCount; ++hand) {
             Hand& state = mHands[hand];
             XrPosef pose = {};
-            bool const tracked = mContext.input->getGripPose(hand, &pose);
+            bool const tracked = mContext.input->getGripPose(hand, &pose) &&
+                                 !mContext.input->isHandInteraction(hand);
 
             if (tracked && state.asset == nullptr && !state.loadFailed) {
                 loadModel(hand);
