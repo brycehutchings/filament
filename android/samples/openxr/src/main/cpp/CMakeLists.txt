@@ -38,6 +38,7 @@ add_library(helloxr SHARED
     "${REPO_ROOT}/samples/helloxr_jetpack_ui.cpp"
     "${REPO_ROOT}/samples/helloxr_jetpack_interaction.cpp"
     "${REPO_ROOT}/samples/helloxr_quad_layer.cpp"
+    "${REPO_ROOT}/samples/helloxr_quad_depth.cpp"
     "${REPO_ROOT}/samples/helloxr_rendermodel.cpp"
     "${REPO_ROOT}/samples/helloxr_handmesh.cpp"
     "${REPO_ROOT}/samples/helloxr_vertexstreaming.cpp"

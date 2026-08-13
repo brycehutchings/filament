@@ -43,6 +43,8 @@ public:
 
     bool isEnabled() const noexcept;
     uint8_t getSampleCount() const noexcept;
+    XrPosef getPose() const noexcept;
+    XrExtent2Df getSize() const noexcept;
 
 private:
     struct Impl;

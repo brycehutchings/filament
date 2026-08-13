@@ -23,6 +23,8 @@ struct QuadLayer::Impl {
     View* view = nullptr;
     Camera* camera = nullptr;
     utils::Entity cameraEntity;
+    XrPosef pose = { { 0.0f, 0.0f, 0.0f, 1.0f }, { -0.7f, 0.0f, -1.5f } };
+    XrExtent2Df size = { 0.5f, 0.5f };
 };
 
 QuadLayer::QuadLayer() : mImpl(std::make_unique<Impl>()) {}
@@ -114,9 +116,8 @@ bool QuadLayer::render(RenderTarget* target, filament::SwapChain* swapChain, XrS
     submission->layer.subImage.swapchain = xrSwapchain;
     submission->layer.subImage.imageRect = { { 0, 0 }, { int32_t(SIZE), int32_t(SIZE) } };
     submission->layer.subImage.imageArrayIndex = 0;
-    submission->layer.pose.orientation = { 0.0f, 0.0f, 0.0f, 1.0f };
-    submission->layer.pose.position = { -0.7f, 0.0f, -1.5f };
-    submission->layer.size = { 0.5f, 0.5f };
+    submission->layer.pose = mImpl->pose;
+    submission->layer.size = mImpl->size;
 
     if (depthTestSupported) {
         submission->depthTest = { XR_TYPE_COMPOSITION_LAYER_DEPTH_TEST_FB, nullptr, XR_TRUE,
@@ -132,6 +133,14 @@ bool QuadLayer::isEnabled() const noexcept {
 
 uint8_t QuadLayer::getSampleCount() const noexcept {
     return mImpl->sampleCount;
+}
+
+XrPosef QuadLayer::getPose() const noexcept {
+    return mImpl->pose;
+}
+
+XrExtent2Df QuadLayer::getSize() const noexcept {
+    return mImpl->size;
 }
 
 } // namespace helloxr

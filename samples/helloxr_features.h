@@ -65,8 +65,12 @@ class Scene;
 
 namespace helloxr {
 
+constexpr uint8_t NORMAL_SCENE_LAYER = 0x01;
+constexpr uint8_t QUAD_DEPTH_PROXY_LAYER = 0x02;
+
 class ControllerInput;
 class JetpackUiLayer;
+class QuadLayer;
 
 // Everything a feature module needs from the host application.
 struct FeatureContext {
@@ -82,6 +86,7 @@ struct FeatureContext {
     std::string dumpPrefix;
     ControllerInput* input = nullptr;
     JetpackUiLayer* jetpackUi = nullptr;
+    QuadLayer* quadLayer = nullptr;
 };
 
 // An optional capability that renders extra content into the scene. Features are constructed before
@@ -108,6 +113,7 @@ std::unique_ptr<Feature> createRenderModels();
 std::unique_ptr<Feature> createHandMeshes();
 std::unique_ptr<Feature> createVertexStreaming();
 std::unique_ptr<Feature> createJetpackInteraction();
+std::unique_ptr<Feature> createQuadDepthProxies();
 
 filament::math::mat4 poseToMat4(XrPosef const& pose);
 

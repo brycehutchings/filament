@@ -1,0 +1,15 @@
+material {
+    name : xrDepthProxy,
+    shadingModel : unlit,
+    colorWrite : false,
+    depthWrite : true,
+    depthCulling : true,
+    culling : none
+}
+
+fragment {
+    void material(inout MaterialInputs material) {
+        prepareMaterial(material);
+        material.baseColor = vec4(0.0);
+    }
+}

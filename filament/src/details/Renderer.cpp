@@ -1121,7 +1121,12 @@ void FRenderer::renderJob(DriverApi& driver, RootArenaScope& rootArenaScope, FVi
     // the clearFlags and clearColor specified below will only apply when rendering into the
     // temporary color buffer. In particular, they won't apply when rendering into the main
     // swapchain (imported render target above)
-    RendererUtils::ColorPassConfig const config{
+    bool const depthReadAfterColorPass =
+            taaOptions.enabled || (hasPostProcess && dofOptions.enabled) ||
+            (engine.debug.shadowmap.visualize_cascades && view.hasShadowing() &&
+                    view.hasDirectionalLighting());
+
+    RendererUtils::ColorPassConfig config{
             .physicalViewport = svp,
             .logicalViewport = xvp,
             .scale = scale,
@@ -1135,7 +1140,7 @@ void FRenderer::renderJob(DriverApi& driver, RootArenaScope& rootArenaScope, FVi
             .hasScreenSpaceReflectionsOrRefractions = ssReflectionsOptions.enabled,
             .enabledStencilBuffer = view.isStencilBufferEnabled(),
             .featureLevel = mFeatureLevel,
-            .isAutoDepthResolveSupported = mIsAutoDepthResolveSupported,
+            .autoResolveDepth = false,
             .fogAsPostProcess = view.hasFog() && engine.features.material.enable_fog_as_postprocess,
     };
 
@@ -1451,6 +1456,11 @@ void FRenderer::renderJob(DriverApi& driver, RootArenaScope& rootArenaScope, FVi
                     "custom color", FrameGraphTexture::Usage::COLOR_ATTACHMENT);
         }
     }
+
+    // Keep attachment-only MSAA depth in tile memory when nothing needs a single-sample result.
+    // An imported depth target or a later depth reader still receives the backend's native resolve.
+    config.autoResolveDepth = mIsAutoDepthResolveSupported &&
+                              (importedDepth || depthReadAfterColorPass);
 
     // the color pass itself + color-grading as subpass if needed
     auto colorPassOutput = RendererUtils::colorPass(fg, "Color Pass", mEngine, view, {

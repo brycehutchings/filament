@@ -119,10 +119,11 @@ struct Config {
 #endif
     double nearPlane = 0.05;
     double farPlane = 100.0;
+    double renderScale = 1.0;
     uint8_t msaa = 4;               // 1 disables multi-sampling; only 1 and 4 are meaningful
     uint8_t quadMsaa = 0;           // 0 means "same as msaa"
     bool validation = true;
-    bool depthLayer = true;
+    bool depthLayer = false;
     bool listExtensions = false;
     bool renderModels = true;
     bool handMeshes = true;
@@ -537,6 +538,9 @@ public:
 #endif
 
     ~HelloXr() {
+        if (mEngine) {
+            mEngine->flushAndWait();
+        }
         for (auto& feature: mFeatures) {
             if (feature) {
                 feature->terminate();
@@ -545,7 +549,6 @@ public:
         mFeatures.clear();
         mControllerInput.terminate();
         if (mEngine) {
-            mEngine->flushAndWait();
             mEngine->destroy(mSkybox);
             mEngine->destroy(mIndirectLight);
             mEngine->destroy(mIblTexture);
@@ -695,6 +698,9 @@ private:
         if (mConfig.jetpackUi) {
             mFeatures.push_back(helloxr::createJetpackInteraction());
         }
+        if (mConfig.jetpackUi || mConfig.quadLayer) {
+            mFeatures.push_back(helloxr::createQuadDepthProxies());
+        }
     }
 
     // Runs after the scene exists, and drops any feature that cannot set itself up.
@@ -702,7 +708,7 @@ private:
         helloxr::FeatureContext const context{ mXrInstance, mSession, mAppSpace, mViewSpace,
             mEngine, mScene, mMaterial,
             mConfig.dumpFrame != 0 ? mConfig.dumpPrefix : std::string(), &mControllerInput,
-            &mJetpackUi };
+            &mJetpackUi, &mQuadLayer };
         for (auto& feature: mFeatures) {
             if (!feature) {
                 continue;
@@ -796,14 +802,16 @@ private:
                     XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME);
         }
 
-        mCompositionLayerDepthTestSupported =
-                supports(XR_FB_COMPOSITION_LAYER_DEPTH_TEST_EXTENSION_NAME);
-        if (mCompositionLayerDepthTestSupported) {
-            extensions.push_back(XR_FB_COMPOSITION_LAYER_DEPTH_TEST_EXTENSION_NAME);
-            XRLOG("composition layer depth test: enabled");
-        } else {
-            XRLOG("warning: runtime does not support %s; composition layers will not share depth",
-                    XR_FB_COMPOSITION_LAYER_DEPTH_TEST_EXTENSION_NAME);
+        if (mConfig.depthLayer) {
+            mCompositionLayerDepthTestSupported =
+                    supports(XR_FB_COMPOSITION_LAYER_DEPTH_TEST_EXTENSION_NAME);
+            if (mCompositionLayerDepthTestSupported) {
+                extensions.push_back(XR_FB_COMPOSITION_LAYER_DEPTH_TEST_EXTENSION_NAME);
+                XRLOG("composition layer depth test: enabled");
+            } else {
+                XRLOG("warning: runtime does not support %s; composition layers will not share "
+                      "depth", XR_FB_COMPOSITION_LAYER_DEPTH_TEST_EXTENSION_NAME);
+            }
         }
 
         mFoveation.requestExtensions(mConfig.foveation, supports, &extensions);
@@ -894,10 +902,13 @@ private:
         mEyeWidth = 0;
         mEyeHeight = 0;
         for (auto const& view: mViewConfigs) {
-            mEyeWidth = std::max(mEyeWidth, view.recommendedImageRectWidth);
-            mEyeHeight = std::max(mEyeHeight, view.recommendedImageRectHeight);
+            mEyeWidth = std::max(mEyeWidth,
+                uint32_t(view.recommendedImageRectWidth * mConfig.renderScale));
+            mEyeHeight = std::max(mEyeHeight,
+                uint32_t(view.recommendedImageRectHeight * mConfig.renderScale));
         }
-        XRLOG("view configuration: %ux%u per eye", mEyeWidth, mEyeHeight);
+        XRLOG("view configuration: %ux%u per eye (render scale %.2f)",
+            mEyeWidth, mEyeHeight, mConfig.renderScale);
 
         uint32_t blendModeCount = 0;
         if (!xrCheck(xrEnumerateEnvironmentBlendModes(mXrInstance, mSystemId, kViewConfigType, 0,
@@ -1245,8 +1256,8 @@ private:
     }
 
     bool createSwapChains() {
-        if (!mFoveation.initialize(mXrInstance, mSession, XR_FOVEATION_LEVEL_MEDIUM_FB,
-                    XR_FOVEATION_DYNAMIC_LEVEL_ENABLED_FB)) {
+        if (!mFoveation.initialize(mXrInstance, mSession, XR_FOVEATION_LEVEL_HIGH_FB,
+                    XR_FOVEATION_DYNAMIC_DISABLED_FB)) {
             return false;
         }
         uint32_t formatCount = 0;
@@ -1279,18 +1290,21 @@ private:
         // A combined depth-stencil format is preferred: once the depth swapchain is submitted for
         // reprojection the runtime barriers the image itself, and the Meta runtime does so with a
         // DEPTH|STENCIL aspect mask, which is invalid on a depth-only image.
-        mDepthFormat = selectSwapChainFormat(formats,
-                { VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT,
-                  VK_FORMAT_D16_UNORM });
-        if (mDepthFormat == 0) {
-            XRLOG("the runtime exposes no depth format; rendering without a depth buffer");
+        if (mDepthLayerSupported) {
+            mDepthFormat = selectSwapChainFormat(formats,
+                    { VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT,
+                      VK_FORMAT_D32_SFLOAT, VK_FORMAT_D16_UNORM });
+            if (mDepthFormat == 0) {
+                XRLOG("the runtime exposes no depth format; rendering without native depth");
+            }
         }
 
-        if (!createXrSwapChain(&mXrSwapChain, mEyeWidth, mEyeHeight, kEyeCount, true, true)) {
+        if (!createXrSwapChain(&mXrSwapChain, mEyeWidth, mEyeHeight, kEyeCount,
+                    mDepthLayerSupported, true)) {
             return false;
         }
         mDepthLayerSupported = mDepthLayerSupported && mXrSwapChain.depth != XR_NULL_HANDLE;
-        XRLOG("depth submission: %s", mDepthLayerSupported ? "enabled" : "disabled");
+        XRLOG("native depth submission: %s", mDepthLayerSupported ? "enabled" : "disabled");
 
         // A flat panel the compositor samples at its own resolution, which is why it is worth a
         // layer of its own rather than a quad inside the scene.
@@ -1394,6 +1408,8 @@ private:
         sharedContext.graphicsQueueIndex = 0;
         sharedContext.debugUtilsEnabled = mDebugUtilsEnabled;
         sharedContext.multiviewSupported = true;
+        // Advertise the Vulkan capability independently of native XR depth submission. Filament
+        // omits the per-pass resolve when projection depth has no consumer after rasterization.
         sharedContext.depthStencilResolveSupported = maximumSamples() > 1;
         sharedContext.depthResolveMode = mDepthResolveMode;
 
@@ -1615,6 +1631,11 @@ private:
 
         mView->setScene(mScene);
         mView->setCamera(mCamera);
+        // Layer 0 contains normal scene content; layer 1 contains depth-only compositor-quad
+        // proxies. Only the projection View enables both, so the fixed quad View cannot render
+        // its own proxy into its offscreen swapchain.
+        mView->setVisibleLayers(0xFF,
+            helloxr::NORMAL_SCENE_LAYER | helloxr::QUAD_DEPTH_PROXY_LAYER);
         mView->setViewport({ 0, 0, mEyeWidth, mEyeHeight });
         mView->setShadowingEnabled(false);
         mView->setStereoscopicOptions({ .enabled = true });
@@ -2182,6 +2203,7 @@ void printUsage() {
           "  --timeout=S       stop after S seconds, 0 to disable\n"
           "  --near=D          near plane distance in meters (default: 0.05)\n"
           "  --far=D           far plane distance in meters (default: 100)\n"
+          "  --render-scale=S  scale recommended eye resolution (default: 1.0)\n"
           "  --msaa=N          multi-sample count, 1 to disable (default: 4)\n"
           "  --quad-msaa=N     multi-sample count for the quad layer (default: same as --msaa)\n"
           "  --dump-frame=N    read frame N back and report per-eye color and depth stats\n"
@@ -2189,7 +2211,8 @@ void printUsage() {
           "  --dump-prefix=P   file name prefix for --dump-frame\n"
           "  --ibl=PREFIX      load PREFIX_ibl.ktx and PREFIX_skybox.ktx, empty to disable\n"
           "  --no-validation   do not request the Vulkan validation layer\n"
-          "  --no-depth-layer  do not submit depth with the projection layer\n"
+          "  --depth-layer     submit native XR depth (default: off)\n"
+          "  --no-depth-layer  use transient MSAA projection depth only\n"
           "  --list-extensions log every extension the runtime exposes\n"
           "  --no-render-models  do not draw the runtime's controller models\n"
           "  --no-hand-meshes  do not draw tracked hand meshes\n"
@@ -2223,6 +2246,8 @@ bool parseArguments(std::vector<std::string> const& args, Config* config) {
             config->nearPlane = std::strtod(arg.c_str() + 7, nullptr);
         } else if (startsWith("--far=")) {
             config->farPlane = std::strtod(arg.c_str() + 6, nullptr);
+        } else if (startsWith("--render-scale=")) {
+            config->renderScale = std::strtod(arg.c_str() + 15, nullptr);
         } else if (startsWith("--msaa=")) {
             config->msaa = uint8_t(std::strtoul(arg.c_str() + 7, nullptr, 10));
         } else if (startsWith("--quad-msaa=")) {
@@ -2235,6 +2260,8 @@ bool parseArguments(std::vector<std::string> const& args, Config* config) {
             config->ibl = arg.substr(6);
         } else if (arg == "--no-validation") {
             config->validation = false;
+        } else if (arg == "--depth-layer") {
+            config->depthLayer = true;
         } else if (arg == "--no-depth-layer") {
             config->depthLayer = false;
         } else if (arg == "--list-extensions") {

@@ -73,8 +73,8 @@ public:
         bool enabledStencilBuffer;
         // Backend feature level
         backend::FeatureLevel featureLevel;
-        // Auto depth resolve supported
-        bool isAutoDepthResolveSupported;
+        // Resolve multisampled depth as part of the color pass.
+        bool autoResolveDepth;
         // Use post-process fog
         bool fogAsPostProcess;
     };

@@ -42,6 +42,7 @@ set(MATERIAL_SRCS
         materials/sandboxUnlit.mat
         materials/texturedLit.mat
         materials/uvmorph.mat
+        materials/xrDepthProxy.mat
         materials/xrglass.mat
         materials/xrhand.mat
 )
@@ -347,8 +348,8 @@ if (FILAMENT_ENABLE_OPENXR)
     include_directories(${GENERATION_ROOT})
     add_executable(helloxr helloxr.cpp helloxr_features.cpp helloxr_foveation.cpp
             helloxr_input.cpp helloxr_jetpack_ui.cpp helloxr_jetpack_interaction.cpp
-            helloxr_quad_layer.cpp helloxr_rendermodel.cpp helloxr_handmesh.cpp
-            helloxr_vertexstreaming.cpp)
+            helloxr_quad_layer.cpp helloxr_quad_depth.cpp helloxr_rendermodel.cpp
+            helloxr_handmesh.cpp helloxr_vertexstreaming.cpp)
     target_compile_options(helloxr PRIVATE ${COMPILER_FLAGS})
     target_link_libraries(helloxr PRIVATE
         filament

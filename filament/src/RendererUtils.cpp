@@ -112,8 +112,6 @@ RendererUtils::ColorPassOutput RendererUtils::colorPass(
                     data.color = builder.createTexture("Color Buffer", colorBufferDesc);
                 }
 
-                const bool canAutoResolveDepth = config.isAutoDepthResolveSupported;
-
                 FrameGraphTexture::Usage depthStencilUsage = FrameGraphTexture::Usage::DEPTH_ATTACHMENT;
 
                 if (!data.depth) {
@@ -151,7 +149,8 @@ RendererUtils::ColorPassOutput RendererUtils::colorPass(
                             // buffer with MS and manually resolve it (see "Resolved Depth Buffer"
                             // pass).
                             .depth = colorBufferDesc.depth,
-                            .samples = canAutoResolveDepth ? colorBufferDesc.samples : uint8_t(config.msaa),
+                            .samples = config.autoResolveDepth ? colorBufferDesc.samples
+                                                               : uint8_t(config.msaa),
                             .type = colorBufferDesc.type,
                             .format = format,
                     });
