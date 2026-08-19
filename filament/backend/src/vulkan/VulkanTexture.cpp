@@ -149,15 +149,6 @@ inline VulkanLayout getDefaultLayoutImpl(VkImageUsageFlags vkusage) {
     return getDefaultLayoutImpl(usage);
 }
 
-SamplerType getSamplerTypeFromDepth(uint32_t const depth) {
-  return depth > 1 ? SamplerType::SAMPLER_2D_ARRAY
-                                  : SamplerType::SAMPLER_2D;
-}
-
-uint8_t getLayerCountFromDepth(uint32_t const depth) {
-    return getLayerCount(getSamplerTypeFromDepth(depth), depth);
-}
-
 VkImageUsageFlags getUsage(VulkanContext const& context, uint8_t samples,
         VkPhysicalDevice physicalDevice, VkFormat vkFormat, TextureUsage tusage) {
     VkImageUsageFlags usage = {};
@@ -177,6 +168,8 @@ VkImageUsageFlags getUsage(VulkanContext const& context, uint8_t samples,
 
     // Determine if we can use the transient usage flag combined with lazily allocated memory.
     const bool useTransientAttachment =
+            // Imported images were not created with transient attachment usage.
+            physicalDevice != VK_NULL_HANDLE &&
             // Lazily allocated memory is available.
             context.isLazilyAllocatedMemorySupported() &&
             // Usage consists of attachment flags only.
@@ -378,14 +371,14 @@ VulkanTexture::VulkanTexture(VulkanContext const& context, VkDevice device, VmaA
         VkDeviceMemory memory, VkFormat format, VkSamplerYcbcrConversion conversion,
         VkDeviceMemory stagingMemory, VkBuffer stagingBuffer, Platform::ExternalImageHandle ahBuffer,
         uint8_t levels, uint8_t samples, uint32_t width, uint32_t height, uint32_t depth,
-        TextureUsage tusage, VulkanStagePool& stagePool)
-    : HwTexture(getSamplerTypeFromDepth(depth), levels, samples, width, height, depth,
-              TextureFormat::UNUSED, tusage, false),
+        TextureUsage tusage, VulkanStagePool& stagePool, TextureFormat tformat, SamplerType const target)
+    : HwTexture(target, levels, samples, width, height, depth,
+              tformat, tusage, false),
       mState(fvkmemory::resource_ptr<VulkanTextureState>::construct(resourceManager, stagePool,
               commands, allocator, device, image, memory,
               stagingMemory, stagingBuffer, ahBuffer,
-              format, fvkutils::getViewType(SamplerType::SAMPLER_2D),
-              /*mipLevels=*/levels, getLayerCountFromDepth(depth), conversion,
+              format, fvkutils::getViewType(target),
+              /*mipLevels=*/levels, getLayerCount(target, depth), conversion,
               getUsage(context, samples, VK_NULL_HANDLE, format, tusage),
               any(tusage & TextureUsage::PROTECTED))) {
     mPrimaryViewRange = mState->mFullViewRange;
@@ -459,7 +452,7 @@ VulkanTexture::VulkanTexture(VkDevice device, VkPhysicalDevice physicalDevice,
     }
 
     if (imageInfo.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) {
-        samples = fvkutils::reduceSampleCount(samples, limits.sampledImageDepthSampleCounts);
+        samples = fvkutils::reduceSampleCount(samples, limits.framebufferDepthSampleCounts);
     }
     this->samples = samples;
     imageInfo.samples = (VkSampleCountFlagBits) samples;

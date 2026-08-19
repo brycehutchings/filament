@@ -268,6 +268,7 @@ Texture* Texture::Builder::build(Engine& engine) {
     }
 
     auto const& featureFlags = downcast(engine).features.engine.debug;
+    const bool imported = mImpl->mImportedId;
 
     bool const formatGenMipmappable =
             downcast(engine).getDriverApi().isTextureFormatMipmappable(mImpl->mFormat);
@@ -277,7 +278,7 @@ Texture* Texture::Builder::build(Engine& engine) {
             (formatGenMipmappable &&
                     mImpl->mLevels > 1 &&
                     (mImpl->mWidth > 1 || mImpl->mHeight > 1) &&
-                    !mImpl->mExternal)) {
+                    !mImpl->mExternal && !imported)) {
         mImpl->mUsage |= TextureUsage::GEN_MIPMAPPABLE;
     }
 
@@ -286,13 +287,13 @@ Texture* Texture::Builder::build(Engine& engine) {
     // now, we workaround the issue by making sure any color attachment can be the source of a copy
     // for readPixels().
     mImpl->mHasBlitSrc = any(mImpl->mUsage & TextureUsage::BLIT_SRC);
-    if (!mImpl->mHasBlitSrc && any(mImpl->mUsage & TextureUsage::COLOR_ATTACHMENT)) {
+    if (!imported && !mImpl->mHasBlitSrc && any(mImpl->mUsage & TextureUsage::COLOR_ATTACHMENT)) {
         mImpl->mUsage |= TextureUsage::BLIT_SRC;
     }
 
     const bool sampleable = bool(mImpl->mUsage & TextureUsage::SAMPLEABLE);
+    const bool colorAttachment = bool(mImpl->mUsage & TextureUsage::COLOR_ATTACHMENT);
     const bool swizzled = mImpl->mTextureIsSwizzled;
-    const bool imported = mImpl->mImportedId;
     const bool external = mImpl->mExternal;
     const bool asynchronous = mImpl->mAsynchronous;
 
@@ -303,8 +304,10 @@ Texture* Texture::Builder::build(Engine& engine) {
     FILAMENT_CHECK_PRECONDITION((swizzled && sampleable) || !swizzled)
             << "Swizzled texture must be SAMPLEABLE";
 
-    FILAMENT_CHECK_PRECONDITION((imported && sampleable) || !imported)
-            << "Imported texture must be SAMPLEABLE";
+    // An imported image is often one somebody else owns and that we only ever render into, such as
+    // an image belonging to an XR runtime, so being sampleable is not a reasonable thing to demand.
+    FILAMENT_CHECK_PRECONDITION(!imported || sampleable || colorAttachment)
+            << "Imported texture must be SAMPLEABLE or a color attachment";
 
     FILAMENT_CHECK_PRECONDITION(!(external && asynchronous))
             << "Asynchronous operation is not supported for external texture";

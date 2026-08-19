@@ -146,6 +146,14 @@ FRenderer::FRenderer(FEngine& engine) :
     mIsFrameBufferFetchSupported = driver.isFrameBufferFetchSupported();
     mIsFrameBufferFetchMultiSampleSupported = driver.isFrameBufferFetchMultiSampleSupported();
     mIsAutoDepthResolveSupported = driver.isAutoDepthResolveSupported();
+    if (engine.getBackend() == Backend::VULKAN) {
+        mSupportedMsaaSampleCounts = 1;
+        for (uint32_t const samples: { 2u, 4u, 8u, 16u }) {
+            if (driver.isRenderTargetSampleCountSupported(samples)) {
+                mSupportedMsaaSampleCounts |= samples;
+            }
+        }
+    }
 
     // our default HDR translucent format, fallback to LDR if not supported by the backend
     if (!driver.isRenderTargetFormatSupported(TextureFormat::RGBA16F)) {
@@ -771,18 +779,21 @@ void FRenderer::renderJob(DriverApi& driver, RootArenaScope& rootArenaScope, FVi
     auto colorGrading = view.getColorGrading();
     auto ssReflectionsOptions = view.getScreenSpaceReflectionsOptions();
     auto guardBandOptions = view.getGuardBandOptions();
-    const bool isRenderingMultiview = view.hasStereo() &&
-            engine.getConfig().stereoscopicType == StereoscopicType::MULTIVIEW;
-    // FIXME: This is to override some settings that are not supported for multiview at the moment.
-    // Remove this when all features are supported.
+    const bool isRenderingMultiview =
+            view.hasStereo() && engine.getConfig().stereoscopicType == StereoscopicType::MULTIVIEW;
     if (isRenderingMultiview) {
         hasPostProcess = false;
-        msaaOptions.enabled = false;
 
         // Picking is not supported for multiview rendering. Clear any pending picking queries.
         view.clearPickingQueries();
     }
-    const uint8_t msaaSampleCount = msaaOptions.enabled ? msaaOptions.sampleCount : 1u;
+    uint8_t msaaSampleCount = msaaOptions.enabled ? msaaOptions.sampleCount : 1u;
+    while (msaaSampleCount & (msaaSampleCount - 1u)) {
+        msaaSampleCount &= msaaSampleCount - 1u;
+    }
+    while (msaaSampleCount > 1 && !(mSupportedMsaaSampleCounts & msaaSampleCount)) {
+        msaaSampleCount >>= 1u;
+    }
 
     if (!hasPostProcess) {
         // disable all effects that are part of post-processing
@@ -1091,15 +1102,6 @@ void FRenderer::renderJob(DriverApi& driver, RootArenaScope& rootArenaScope, FVi
     // is "replacing" another one. E.g. typically when the color pass ends-up drawing directly
     // here.
     auto [viewRenderTarget, attachmentMask] = getRenderTarget(view);
-    FrameGraphId<FrameGraphTexture> const fgViewRenderTarget = fg.import("viewRenderTarget", {
-            .attachments = attachmentMask,
-            .viewport = DEBUG_DYNAMIC_SCALING ? svp : vp,
-            .clearColor = clearColor,
-            .samples = 0,
-            .clearFlags = clearFlags,
-            .keepOverrideStart = keepOverrideStartFlags,
-            .keepOverrideEnd = keepOverrideEndFlags
-    }, viewRenderTarget);
 
     const TextureFormat hdrFormat = getHdrFormat(view, needsAlphaChannel);
 
@@ -1363,8 +1365,41 @@ void FRenderer::renderJob(DriverApi& driver, RootArenaScope& rootArenaScope, FVi
 
     const_cast<RenderPass&>(pass).finalize(engine, driver);
 
+    // With post-processing disabled, render directly into a simple custom color target. The
+    // backend supplies the multisampled sidecar and resolves color into the imported image.
+    FrameGraphId<FrameGraphTexture> importedColor{};
+    if (customRenderTarget && !hasPostProcess && customRenderTarget->getSamples() <= 1 &&
+            customRenderTarget->getAttachmentMask() == TargetBufferFlags::COLOR0 &&
+            !hasScreenSpaceRefraction && !ssReflectionsOptions.enabled && xvp == svp &&
+            !engine.debug.stereo.combine_multiview_images &&
+            !engine.debug.shadowmap.display_shadow_texture) {
+        auto const attachment =
+                customRenderTarget->getAttachment(RenderTarget::AttachmentPoint::COLOR0);
+        FTexture const* const texture = attachment.texture;
+        uint32_t const layerCount = std::max<uint32_t>(1u, attachment.layerCount);
+        if (texture && attachment.mipLevel == 0 && attachment.layer == 0 &&
+                attachment.face == RenderTarget::CubemapFace::POSITIVE_X &&
+                texture->getTarget() != Texture::Sampler::SAMPLER_CUBEMAP &&
+                layerCount == colorBufferDesc.depth && texture->getWidth(0) == svp.width &&
+                texture->getHeight(0) == svp.height) {
+            importedColor = fg.import("custom color",
+                    {
+                        .width = svp.width,
+                        .height = svp.height,
+                        .depth = layerCount,
+                        .type = layerCount > 1 ? SamplerType::SAMPLER_2D_ARRAY
+                                               : SamplerType::SAMPLER_2D,
+                        .format = texture->getFormat(),
+                    },
+                    FrameGraphTexture::Usage::COLOR_ATTACHMENT |
+                            (texture->getUsage() & TextureUsage::SAMPLEABLE),
+                    FrameGraphTexture{ .handle = texture->getHwHandle() });
+        }
+    }
+
     // the color pass itself + color-grading as subpass if needed
-    auto colorPassOutput = RendererUtils::colorPass(fg, "Color Pass", mEngine, view, {
+    auto colorPassOutput = RendererUtils::colorPass(fg, "Color Pass", mEngine, view,
+            { .linearColor = importedColor,
                 .shadows = blackboard.get<FrameGraphTexture>("shadows"),
                 .ssao = blackboard.get<FrameGraphTexture>("ssao"),
                 .ssr = ssrConfig.ssr,
@@ -1598,14 +1633,14 @@ void FRenderer::renderJob(DriverApi& driver, RootArenaScope& rootArenaScope, FVi
         bool const inputIsColorPass = (input == postProcessInput);
         if (blendModeTranslucent ||
             xvp != svp ||
-            (inputIsColorPass &&
-                    (msaaSampleCount > 1 ||
+                (inputIsColorPass &&
+                    ((msaaSampleCount > 1 && !importedColor) ||
                     colorGradingConfig.asSubpass ||
                     hasScreenSpaceRefraction ||
                     ssReflectionsOptions.enabled))) {
             input = ppm.blit(fg, blendModeTranslucent, input, xvp, {
                             .width = vp.width, .height = vp.height,
-                            .format = colorGradingConfig.ldrFormat },
+                        .format = colorGradingConfig.ldrFormat },
                     SamplerMagFilter::NEAREST, SamplerMinFilter::NEAREST);
         }
     }
@@ -1623,8 +1658,25 @@ void FRenderer::renderJob(DriverApi& driver, RootArenaScope& rootArenaScope, FVi
 //    auto debug = structure
 //    fg.forwardResource(fgViewRenderTarget, debug ? debug : input);
 
-    fg.forwardResource(fgViewRenderTarget, input);
-    fg.present(fgViewRenderTarget);
+    if (input == importedColor) {
+        fg.present(input);
+    } else {
+        // the clearFlags and clearColor set below are "sticky" to the imported target, meaning
+        // they will apply anytime we render into this target, THIS INCLUDES when this target
+        // is "replacing" another one. E.g. typically when the color pass ends-up drawing directly
+        // here.
+        FrameGraphId<FrameGraphTexture> const fgViewRenderTarget = fg.import("viewRenderTarget",
+                { .attachments = attachmentMask,
+                    .viewport = DEBUG_DYNAMIC_SCALING ? svp : vp,
+                    .clearColor = clearColor,
+                    .samples = 0,
+                    .clearFlags = clearFlags,
+                    .keepOverrideStart = keepOverrideStartFlags,
+                    .keepOverrideEnd = keepOverrideEndFlags },
+                viewRenderTarget);
+        fg.forwardResource(fgViewRenderTarget, input);
+        fg.present(fgViewRenderTarget);
+    }
 
     fg.compile();
 

@@ -943,9 +943,11 @@ bool WebGPUDriver::isMSAASwapChainSupported(uint32_t) {
     return false;
 }
 
-bool WebGPUDriver::isProtectedContentSupported() {
-    return false;
+bool WebGPUDriver::isRenderTargetSampleCountSupported(uint32_t samples) {
+    return samples == 1 || samples == 4;
 }
+
+bool WebGPUDriver::isProtectedContentSupported() { return false; }
 
 
 bool WebGPUDriver::isStereoSupported() {

@@ -146,6 +146,9 @@ fvkmemory::resource_ptr<VulkanTexture> initMsaaTexture(
         uint8_t samples, VulkanStagePool& stagePool) {
     assert_invariant(texture);
     auto msTexture = texture->getSidecar();
+    if (msTexture && msTexture->samples != samples) {
+        msTexture = {};
+    }
     if (UTILS_UNLIKELY(!msTexture)) {
         // Clear all usage flags that are not related to attachments, so that we can
         // use the transient usage flag.
@@ -380,6 +383,9 @@ VulkanRenderTarget::VulkanRenderTarget(VkDevice device, VkPhysicalDevice physica
                     .texture = texture,
                     .layerCount = layerCount,
                 };
+                if (texture->isTransientAttachment()) {
+                    rpkey.usesLazilyAllocatedMemory |= (1 << index);
+                }
             }
             fbkey.color[index] = msaaAttachment.getImageView();
             msaaAttachments.push_back(msaaAttachment);

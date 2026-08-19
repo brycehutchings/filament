@@ -3023,6 +3023,11 @@ bool OpenGLDriver::isMSAASwapChainSupported(uint32_t const samples) {
     return mPlatform.isMSAASwapChainSupported(samples);
 }
 
+bool OpenGLDriver::isRenderTargetSampleCountSupported(uint32_t const samples) {
+    return samples > 0 && (samples & (samples - 1u)) == 0 &&
+           samples <= uint32_t(getBackendState().gets.max_samples);
+}
+
 bool OpenGLDriver::isProtectedContentSupported() {
     return mPlatform.isProtectedContextSupported();
 }

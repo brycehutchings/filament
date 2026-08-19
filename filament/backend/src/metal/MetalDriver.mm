@@ -1439,6 +1439,10 @@ bool MetalDriver::isMSAASwapChainSupported(uint32_t) {
     return true;
 }
 
+bool MetalDriver::isRenderTargetSampleCountSupported(uint32_t samples) {
+    return [mContext->device supportsTextureSampleCount:samples];
+}
+
 bool MetalDriver::isProtectedContentSupported() {
     // the SWAP_CHAIN_CONFIG_PROTECTED_CONTENT flag is not supported
     return false;

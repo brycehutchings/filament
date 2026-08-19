@@ -1003,7 +1003,9 @@ void VulkanDriver::createTextureExternalImage2R(Handle<HwTexture> th, backend::S
             mPlatform->getDevice(), mAllocator, &mResourceManager, &mCommands, vkimage, memory,
             vkformat, conversion, imgData.internal.stagingMemory, imgData.internal.stagingBuffer,
             externalImage, static_cast<uint8_t>(metadata.mipLevels), metadata.samples,
-            metadata.width, metadata.height, metadata.layers, usage, mStagePool);
+            metadata.width, metadata.height, metadata.layers, usage, mStagePool,
+            metadata.filamentFormat,
+            metadata.layers > 1 ? SamplerType::SAMPLER_2D_ARRAY : SamplerType::SAMPLER_2D);
     auto& commands = mCommands.get();
     // Unlike uploaded textures or swapchains, we need to explicit transition this
     // texture into the read layout.
@@ -1031,12 +1033,27 @@ void VulkanDriver::createTextureExternalImagePlaneR(Handle<HwTexture> th,
     assert_invariant(false && "Not supported in Vulkan backend");
 }
 
-void VulkanDriver::importTextureCommon(Handle<HwTexture> th, intptr_t id,
-        SamplerType target, uint8_t levels,
-        TextureFormat format, uint8_t samples, uint32_t w, uint32_t h, uint32_t depth,
-        TextureUsage usage, utils::ImmutableCString&& tag) {
-    // not supported in this backend
-    assert_invariant(false && "Not supported in Vulkan backend");
+void VulkanDriver::importTextureCommon(Handle<HwTexture> th, intptr_t id, SamplerType target,
+        uint8_t levels, TextureFormat format, uint8_t samples, uint32_t w, uint32_t h,
+        uint32_t depth, TextureUsage usage, utils::ImmutableCString&& tag) {
+    // The caller owns the image and its memory; we only wrap it so it can be used as an attachment
+    // or sampled from. Layout tracking starts from UNDEFINED, so the first use discards whatever
+    // the image held.
+    auto texture = resource_ptr<VulkanTexture>::make(&mResourceManager, th, mContext,
+            mPlatform->getDevice(), mAllocator, &mResourceManager, &mCommands, (VkImage) id,
+            VK_NULL_HANDLE, fvkutils::getVkFormat(format), VK_NULL_HANDLE, VK_NULL_HANDLE,
+            VK_NULL_HANDLE, Platform::ExternalImageHandle(), levels, samples, w, h, depth, usage,
+            mStagePool, format, target);
+
+    // Attachment-only images transition at first render-pass use. This is important for external
+    // swapchains because the image may not be touched before the owner has acquired and waited it.
+    if (any(usage & TextureUsage::SAMPLEABLE)) {
+        VulkanCommandBuffer& commandsBuf = mCommands.get();
+        texture->transitionLayout(&commandsBuf, texture->getPrimaryViewRange(),
+                texture->getDefaultLayout());
+    }
+
+    texture.inc();
     mResourceManager.associateHandle(th.getId(), std::move(tag));
 }
 
@@ -1311,11 +1328,11 @@ void VulkanDriver::createSwapChainR(Handle<HwSwapChain> sch, void* nativeWindow,
 
     if ((flags & backend::SWAP_CHAIN_CONFIG_SRGB_COLORSPACE) != 0 && !isSRGBSwapChainSupported()) {
         FVK_LOGW << "sRGB swapchain requested, but Platform does not support it";
-        flags = flags | ~(backend::SWAP_CHAIN_CONFIG_SRGB_COLORSPACE);
+        flags &= ~backend::SWAP_CHAIN_CONFIG_SRGB_COLORSPACE;
     }
     if ((flags & backend::SWAP_CHAIN_CONFIG_MSAA_4_SAMPLES) != 0 && !isMSAASwapChainSupported(4)) {
         FVK_LOGW << "MSAAx4 swapchain requested, but Platform does not support it";
-        flags = flags | ~(backend::SWAP_CHAIN_CONFIG_MSAA_4_SAMPLES);
+        flags &= ~backend::SWAP_CHAIN_CONFIG_MSAA_4_SAMPLES;
     }
     if (flags & backend::SWAP_CHAIN_CONFIG_PROTECTED_CONTENT) {
         if (!isProtectedContentSupported()) {
@@ -1700,7 +1717,9 @@ void VulkanDriver::updateStreams(CommandStream* driver) {
                             VK_NULL_HANDLE, Platform::ExternalImageHandle(),
                             static_cast<uint8_t>(metadata.mipLevels), metadata.samples,
                             metadata.width, metadata.height, metadata.layers,
-                            metadata.filamentUsage, mStagePool);
+                            metadata.filamentUsage, mStagePool, metadata.filamentFormat,
+                            metadata.layers > 1 ? SamplerType::SAMPLER_2D_ARRAY
+                                                : SamplerType::SAMPLER_2D);
 
                     auto& commands = mCommands.get();
                     // Unlike uploaded textures or swapchains, we need to explicit transition this
@@ -1887,8 +1906,18 @@ bool VulkanDriver::isSRGBSwapChainSupported() {
     return mIsSRGBSwapChainSupported;
 }
 
-bool VulkanDriver::isMSAASwapChainSupported(uint32_t) {
-    return mIsMSAASwapChainSupported;
+bool VulkanDriver::isMSAASwapChainSupported(uint32_t const samples) {
+    return mIsMSAASwapChainSupported && isRenderTargetSampleCountSupported(samples);
+}
+
+bool VulkanDriver::isRenderTargetSampleCountSupported(uint32_t const samples) {
+    if (samples == 0 || (samples & (samples - 1u)) != 0) {
+        return false;
+    }
+    auto const& limits = mContext.getPhysicalDeviceLimits();
+    VkSampleCountFlags const supported =
+            limits.framebufferDepthSampleCounts & limits.framebufferColorSampleCounts;
+    return (supported & samples) != 0;
 }
 
 bool VulkanDriver::isProtectedContentSupported() {

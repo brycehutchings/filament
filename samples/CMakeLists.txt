@@ -42,6 +42,9 @@ set(MATERIAL_SRCS
         materials/sandboxUnlit.mat
         materials/texturedLit.mat
         materials/uvmorph.mat
+        materials/xrDepthProxy.mat
+        materials/xrglass.mat
+        materials/xrhand.mat
 )
 
 # Tint does not support setting gl_PointSize, disable the relevant sample if using WebGPU
@@ -332,6 +335,35 @@ if (NOT ANDROID)
     # Install resources
     install(DIRECTORY ${PROJECT_BINARY_DIR}/assets/fonts DESTINATION bin/assets)
     install(DIRECTORY ${PROJECT_BINARY_DIR}/assets/ibl/ DESTINATION bin/assets/ibl)
+endif()
+
+# ==================================================================================================
+# OpenXR sample
+#
+# Deliberately does not depend on filamentapp/SDL: it drives its own frame loop from OpenXR and
+# must stay portable to Android.
+# ==================================================================================================
+
+if (FILAMENT_ENABLE_OPENXR)
+    include_directories(${GENERATION_ROOT})
+        add_executable(helloxr helloxr.cpp helloxr_features.cpp
+            helloxr_input.cpp helloxr_jetpack_ui.cpp helloxr_jetpack_interaction.cpp
+            helloxr_quad_layer.cpp helloxr_quad_depth.cpp helloxr_rendermodel.cpp
+            helloxr_handmesh.cpp helloxr_vertexstreaming.cpp)
+    target_compile_options(helloxr PRIVATE ${COMPILER_FLAGS})
+    target_link_libraries(helloxr PRIVATE
+        filament
+        bluevk
+        filameshio
+        ktxreader
+        geometry
+        gltfio
+        uberarchive
+        sample-resources
+        suzanne-resources
+        openxr_loader
+    )
+    set_target_properties(helloxr PROPERTIES FOLDER Samples)
 endif()
 
 # ==================================================================================================
