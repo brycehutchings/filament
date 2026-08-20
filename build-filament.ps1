@@ -4,7 +4,7 @@ param(
     [switch]$Build,
     [switch]$Install,
     [ValidateSet('Debug', 'Release')]
-    [string]$BuildType = 'Debug'
+    [string]$BuildType = 'Release'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -111,7 +111,8 @@ if ($Configure) {
         '-DFILAMENT_BUILD_TESTING=OFF',
         '-DFILAMENT_ENABLE_OPENXR=ON',
         '-DFILAMENT_SUPPORTS_VULKAN=ON',
-        '-DFILAMENT_SAMPLES_STEREO_TYPE=multiview'
+        '-DFILAMENT_SAMPLES_STEREO_TYPE=multiview',
+        '-DFILAMENT_EXPORT_PREBUILT_EXECUTABLES_DIR=out'
     )
 
     Invoke-CMake 'Configuring Android arm64' @(
