@@ -1,5 +1,6 @@
 [CmdletBinding()]
 param(
+    [switch]$Clean,
     [switch]$Configure,
     [switch]$Build,
     [switch]$Install,
@@ -9,17 +10,22 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-if (-not ($Configure -or $Build -or $Install)) {
-    throw 'Specify at least one of -Configure, -Build, or -Install.'
+if (-not ($Clean -or $Configure -or $Build -or $Install)) {
+    throw 'Specify at least one of -Clean, -Configure, -Build, or -Install.'
 }
 
 $root = $PSScriptRoot
+$out = Join-Path $root 'out'
 $buildTypeName = $BuildType.ToLowerInvariant()
 $windowsBuild = Join-Path $root "out\windows-$buildTypeName-x64"
 $androidBuild = Join-Path $root "out\android-$buildTypeName-aarch64"
 $windowsInstall = Join-Path $root "out\windows-$buildTypeName\filament"
 $androidInstall = Join-Path $root "out\android-$buildTypeName\filament"
 $androidToolchain = Join-Path $root 'build\toolchain-aarch64-linux-android.cmake'
+
+if ($Clean -and (Test-Path $out)) {
+    Remove-Item $out -Recurse -Force
+}
 
 function Invoke-CMake {
     param(
@@ -111,7 +117,13 @@ if ($Configure) {
         '-DFILAMENT_BUILD_TESTING=OFF',
         '-DFILAMENT_ENABLE_OPENXR=ON',
         '-DFILAMENT_SUPPORTS_VULKAN=ON',
+        '-DFILAMENT_ENABLE_MULTIVIEW=ON',
+        '-DFILAMENT_ENABLE_PERFETTO=ON',
+        '-DFILAMENT_SKIP_SAMPLES=ON',
+        '-DFILAMENT_SUPPORTS_OPENGL=OFF',
+        '-DFILAMENT_SUPPORTS_WEBGPU=OFF',
         '-DFILAMENT_SAMPLES_STEREO_TYPE=multiview',
+        '-DUSE_STATIC_CRT=OFF',
         '-DFILAMENT_EXPORT_PREBUILT_EXECUTABLES_DIR=out'
     )
 
@@ -125,6 +137,11 @@ if ($Configure) {
         '-DFILAMENT_BUILD_TESTING=OFF',
         '-DFILAMENT_ENABLE_OPENXR=OFF',
         '-DFILAMENT_SUPPORTS_VULKAN=ON',
+        '-DFILAMENT_ENABLE_MULTIVIEW=ON',
+        '-DFILAMENT_ENABLE_PERFETTO=ON',
+        '-DFILAMENT_SKIP_SAMPLES=ON',
+        '-DFILAMENT_SUPPORTS_OPENGL=OFF',
+        '-DFILAMENT_SUPPORTS_WEBGPU=OFF',
         '-DFILAMENT_SAMPLES_STEREO_TYPE=multiview',
         '-DFILAMENT_SKIP_SAMPLES=ON',
         '-DFILAMENT_IMPORT_PREBUILT_EXECUTABLES_DIR=out'
