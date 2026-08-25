@@ -838,4 +838,6 @@ install(FILES "../LICENSE" DESTINATION .)
 # ==================================================================================================
 add_subdirectory(backend)
 add_subdirectory(test)
+if(FILAMENT_BUILD_TESTING)
 add_subdirectory(benchmark)
+endif()

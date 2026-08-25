@@ -108,9 +108,6 @@ if (FILAMENT_SUPPORTS_OPENGL AND NOT FILAMENT_USE_EXTERNAL_GLES3)
         list(APPEND SRCS src/VirtualMachineEnv.cpp)
     endif ()
     if (ANDROID)
-        list(APPEND SRCS src/AndroidNdk.cpp)
-        list(APPEND SRCS src/AndroidNativeWindow.cpp)
-        list(APPEND SRCS src/AndroidSwapChainHelper.cpp)
         list(APPEND SRCS src/opengl/platforms/ExternalStreamManagerAndroid.cpp)
         list(APPEND SRCS src/opengl/platforms/PlatformEGLAndroid.cpp)
     elseif (IOS)
@@ -380,7 +377,12 @@ if (FILAMENT_SUPPORTS_WEBGPU)
 endif()
 
 if (ANDROID)
-    list(APPEND SRCS src/BackendUtilsAndroid.cpp)
+    list(APPEND SRCS
+            src/AndroidNativeWindow.cpp
+            src/AndroidNdk.cpp
+            src/AndroidSwapChainHelper.cpp
+            src/BackendUtilsAndroid.cpp
+    )
 endif()
 
 # ==================================================================================================
